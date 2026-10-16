@@ -23,10 +23,11 @@ def process_media():
 
         prompt_context = "Summarize this educational input."
         
-        # Конструируем чистый JSON по официальной спецификации Google REST API
+        # КАНОНИЧЕСКАЯ И ПУЛЕНЕПРОБИВАЕМАЯ СТРУКТУРА JSON ДЛЯ GOOGLE GEMINI API
         json_payload = {
             "contents": [
                 {
+                    "role": "user",
                     "parts": [
                         {"text": prompt_context}
                     ]
@@ -43,26 +44,33 @@ def process_media():
             }
         }
 
-        # ПУЛЕНЕПРОБИВАЕМЫЙ REST-ЭНДПОИНТ И ПЕРЕДАЧА КЛЮЧА В ЗАГОЛОВКАХ GOOGLE
+        # Прямой REST-эндпоинт Google Gemini 1.5 Flash
         url = "https://googleapis.com"
         
         headers = {
             "Content-Type": "application/json",
-            "x-goog-api-key": user_api_key  # Ключ летит strictly сюда, без искажения домена!
+            "x-goog-api-key": user_api_key
         }
         
         response = requests.post(url, json=json_payload, headers=headers)
-        res_data = response.json()
+        
+        # Дебаг-лог: выводим сырой статус ответа в консоль Render
+        print(f"VElectronics Debug: Google API Status Code = {response.status_code}")
+        print(f"VElectronics Debug: Raw Google Response = {response.text}")
 
-        # Парсим текстовый ответ из структуры Google JSON
         if response.status_code == 200:
+            res_data = response.json()
             try:
                 result_text = res_data['candidates'][0]['content']['parts'][0]['text']
                 return jsonify({"text": result_text})
-            except (KeyError, IndexError):
-                return jsonify({"error": "Malformed Google API response structure", "raw": res_data}), 500
+            except (KeyError, IndexError, TypeError) as parse_err:
+                return jsonify({"error": "Malformed Google API response structure", "raw": res_data, "parse_error": str(parse_err)}), 500
         else:
-            return jsonify({"error": "Google API returned an error", "status_code": response.status_code, "details": res_data}), 500
+            try:
+                error_json = response.json()
+                return jsonify({"error": "Google API returned an error", "status_code": response.status_code, "details": error_json}), 500
+            except Exception:
+                return jsonify({"error": "Google API returned raw error", "status_code": response.status_code, "raw_text": response.text}), 500
 
     except Exception as e:
         return jsonify({"error": "Internal AI Gateway Processing Error", "details": str(e)}), 500
