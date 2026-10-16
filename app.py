@@ -1,4 +1,4 @@
-import base64
+import hmac
 import os
 import textwrap
 
@@ -7,55 +7,157 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
-GEMINI_URL = (
-    "https://generativelanguage.googleapis.com/"
-    f"v1beta/models/{GEMINI_MODEL}:generateContent"
-)
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+DEVICE_TOKEN = os.environ.get("DEVICE_TOKEN", "")
+
+MODEL_CHAIN = [
+    "gemini-3.5-flash-lite",
+    "gemini-3.6-flash",
+    "gemini-3.8-flash",
+]
+
+RETRYABLE_STATUSES = {
+    408, 429, 500, 502, 503, 504,
+}
 
 SYSTEM_INSTRUCTION = (
     "Summarize the educational material as concise bullet points. "
-    "Each output line must contain at most 23 characters, including spaces. "
-    "Keep the meaning clear. Use Russian if the input is in Russian."
+    "Each line must be at most 23 characters including spaces."
 )
 
 
-def wrap_bullets(text, width=22):
-    """Форматирует ответ: каждая строка — не длиннее width."""
-    result = []
+def format_lines(text, width=22):
+    """Убирает маркеры списка и переносит строки до width символов."""
+    output_lines = []
 
     for raw_line in text.splitlines():
         line = raw_line.strip()
 
-        if not line:
-            continue
-
-        # Убираем возможный маркер списка от модели.
         for marker in ("- ", "* ", "• "):
             if line.startswith(marker):
                 line = line[len(marker):].strip()
                 break
 
-        wrapped = textwrap.wrap(
-            line,
-            width=width,
-            initial_indent="- ",
-            subsequent_indent="  ",
-            break_long_words=True,
-            break_on_hyphens=False,
+        if not line:
+            continue
+
+        output_lines.extend(
+            textwrap.wrap(
+                line,
+                width=width,
+                break_long_words=True,
+                break_on_hyphens=False,
+            )
         )
 
-        result.extend(wrapped or ["-"])
+    return "\n".join(output_lines)
 
-    return "\n".join(result)
+
+def call_gemini(payload):
+    """
+    Пробует модели по очереди.
+    При временной ошибке или неизвестной модели переходит к следующей.
+    """
+    last_status = 503
+    last_details = {"message": "No Gemini model responded"}
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY,
+    }
+
+    for model in MODEL_CHAIN:
+        url = (
+            "https://generativelanguage.googleapis.com/"
+            f"v1beta/models/{model}:generateContent"
+        )
+
+        try:
+            response = requests.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=(3, 10),
+            )
+        except requests.RequestException as err:
+            last_status = 503
+            last_details = {
+                "model": model,
+                "message": str(err),
+            }
+            continue
+
+        if response.ok:
+            try:
+                data = response.json()
+                generated_text = (
+                    data["candidates"][0]
+                    ["content"]["parts"][0]["text"]
+                )
+
+                return {
+                    "ok": True,
+                    "model": model,
+                    "text": generated_text,
+                }, None
+
+            except (ValueError, KeyError, IndexError, TypeError) as err:
+                return None, {
+                    "status": 502,
+                    "details": {
+                        "model": model,
+                        "message": "Gemini returned an unexpected response",
+                        "parse_error": str(err),
+                    },
+                }
+
+        try:
+            details = response.json()
+        except ValueError:
+            details = {"message": response.text[:1000]}
+
+        last_status = response.status_code
+        last_details = {
+            "model": model,
+            "details": details,
+        }
+
+        # При ошибке ключа или неправильном запросе смена модели
+        # не поможет — сразу возвращаем ошибку.
+        if response.status_code not in RETRYABLE_STATUSES and \
+           response.status_code != 404:
+            return None, {
+                "status": response.status_code,
+                "details": last_details,
+            }
+
+    return None, {
+        "status": 503,
+        "details": {
+            "message": "All configured Gemini models failed",
+            "last_error": last_details,
+        },
+    }
 
 
 @app.route("/process", methods=["POST"])
 def process_media():
-    api_key = request.headers.get("x-api-key", "").strip()
+    if not GEMINI_API_KEY:
+        return jsonify({
+            "error": "Server is missing GEMINI_API_KEY"
+        }), 503
 
-    if not api_key:
-        return jsonify({"error": "Missing x-api-key header"}), 401
+    if not DEVICE_TOKEN:
+        return jsonify({
+            "error": "Server is missing DEVICE_TOKEN"
+        }), 503
+
+    received_token = request.headers.get("x-device-token", "")
+
+    if not hmac.compare_digest(received_token, DEVICE_TOKEN):
+        return jsonify({
+            "error": "Invalid device token"
+        }), 401
 
     data = request.get_json(silent=True)
 
@@ -64,52 +166,12 @@ def process_media():
             "error": "Expected a JSON object"
         }), 400
 
-    text = data.get("text", "").strip()
+    text = data.get("text", "")
 
-    if not text and not data.get("image_base64"):
+    if not isinstance(text, str) or not text.strip():
         return jsonify({
-            "error": "Provide 'text' or 'image_base64'"
+            "error": "JSON field 'text' is required"
         }), 400
-
-    parts = []
-
-    if text:
-        parts.append({"text": text})
-
-    image_base64 = data.get("image_base64")
-
-    if image_base64:
-        mime_type = data.get("mime_type", "image/jpeg")
-
-        allowed_types = {
-            "image/jpeg",
-            "image/png",
-            "image/webp",
-            "image/gif",
-        }
-
-        if mime_type not in allowed_types:
-            return jsonify({
-                "error": "Unsupported image mime_type"
-            }), 400
-
-        try:
-            # Проверяем, что строка — корректный Base64.
-            decoded = base64.b64decode(
-                image_base64,
-                validate=True,
-            )
-        except (ValueError, TypeError):
-            return jsonify({
-                "error": "Invalid image_base64"
-            }), 400
-
-        parts.append({
-            "inlineData": {
-                "mimeType": mime_type,
-                "data": base64.b64encode(decoded).decode("ascii"),
-            }
-        })
 
     payload = {
         "systemInstruction": {
@@ -120,7 +182,9 @@ def process_media():
         "contents": [
             {
                 "role": "user",
-                "parts": parts,
+                "parts": [
+                    {"text": text.strip()}
+                ],
             }
         ],
         "generationConfig": {
@@ -129,60 +193,25 @@ def process_media():
         },
     }
 
-    headers = {
-        "Content-Type": "application/json",
-        "x-goog-api-key": api_key,
-    }
+    result, error = call_gemini(payload)
 
-    try:
-        response = requests.post(
-            GEMINI_URL,
-            json=payload,
-            headers=headers,
-            timeout=30,
-        )
-    except requests.RequestException as err:
-        app.logger.exception("Gemini request failed")
+    if error:
         return jsonify({
-            "error": "Could not reach Gemini API",
-            "details": str(err),
-        }), 502
+            "error": "Gemini request failed",
+            "details": error["details"],
+        }), error["status"]
 
-    try:
-        response_data = response.json()
-    except ValueError:
-        return jsonify({
-            "error": "Gemini returned a non-JSON response",
-            "status_code": response.status_code,
-            "details": response.text[:1000],
-        }), 502
+    formatted_text = format_lines(result["text"])
 
-    if not response.ok:
-        return jsonify({
-            "error": "Gemini API request failed",
-            "status_code": response.status_code,
-            "details": response_data,
-        }), 502
-
-    try:
-        generated_text = (
-            response_data["candidates"][0]
-            ["content"]["parts"][0]["text"]
-        )
-    except (KeyError, IndexError, TypeError):
-        return jsonify({
-            "error": "Gemini response did not contain text",
-            "details": response_data,
-        }), 502
-
-    formatted_text = wrap_bullets(generated_text)
-
-    return jsonify({"text": formatted_text})
+    return jsonify({
+        "text": formatted_text,
+        "model": result["model"],
+    })
 
 
 @app.route("/", methods=["GET"])
 def index():
-    return "VElectronics StudyTool backend is running."
+    return "StudyTool backend is running."
 
 
 if __name__ == "__main__":
