@@ -12,7 +12,7 @@ def process_media():
         return jsonify({"error": "Missing personal Google Gemini API Key in Headers"}), 401
 
     try:
-        # Жесткий системный промпт форматирования (Твой Moat на 23 символа)
+        # Жесткий системный промпт форматирования (Твой коммерческий Moat на 23 символа)
         system_instruction = (
             "You are the backend core of VElectronics StudyTool v1. "
             "Analyze the incoming educational material. "
@@ -43,10 +43,14 @@ def process_media():
             }
         }
 
-        # Прямой СВЧ-удар по стабильному эндпоинту Google Gemini 1.5 Flash
-        url = f"https://googleapis.com{user_api_key}"
+        # ПУЛЕНЕПРОБИВАЕМЫЙ REST-ЭНДПОИНТ И ПЕРЕДАЧА КЛЮЧА В ЗАГОЛОВКАХ GOOGLE
+        url = "https://googleapis.com"
         
-        headers = {"Content-Type": "application/json"}
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": user_api_key  # Ключ летит strictly сюда, без искажения домена!
+        }
+        
         response = requests.post(url, json=json_payload, headers=headers)
         res_data = response.json()
 
@@ -55,7 +59,7 @@ def process_media():
             try:
                 result_text = res_data['candidates'][0]['content']['parts'][0]['text']
                 return jsonify({"text": result_text})
-            except KeyError:
+            except (KeyError, IndexError):
                 return jsonify({"error": "Malformed Google API response structure", "raw": res_data}), 500
         else:
             return jsonify({"error": "Google API returned an error", "status_code": response.status_code, "details": res_data}), 500
