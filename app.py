@@ -15,8 +15,8 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-ENROLLMENT_SECRET = os.environ.get("ENROLLMENT_SECRET", "")
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
+ENROLLMENT_SECRET = os.environ.get("ENROLLMENT_SECRET", "0791554f1186185f6bc11b97e0f744092b3336ad9586cdb058a4296a7dd32547")
+DATABASE_URL = os.environ.get("DATABASE_URL", "https://studytool-backend.onrender.com")
 MAX_GEMINI_CONCURRENCY = int(os.environ.get("MAX_GEMINI_CONCURRENCY", "20"))
 GEMINI_SERVICE_TIER = os.environ.get("GEMINI_SERVICE_TIER", "standard").lower()
 
@@ -28,8 +28,8 @@ MODEL_CHAIN = [
 
 RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
 SYSTEM_INSTRUCTION = (
-    "Summarize this educational material as concise plain-text lines. "
-    "Use Russian if the input is Russian. Each line must be at most 22 "
+    "Summarize this educational material in English as concise plain-text lines. "
+    "Each line must be at most 22 "
     "characters including spaces. Do not start lines with bullet symbols."
 )
 
