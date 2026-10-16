@@ -16,7 +16,7 @@ app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 ENROLLMENT_SECRET = os.environ.get("ENROLLMENT_SECRET", "0791554f1186185f6bc11b97e0f744092b3336ad9586cdb058a4296a7dd32547")
-DATABASE_URL = os.environ.get("DATABASE_URL", "https://studytool-backend.onrender.com")
+DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://studytool_db_user:W6ATUkjX4gGpSCg96EGu1z7VhtXF9SHM@dpg-db95r859fdbs7392uis0-a/studytool_db")
 MAX_GEMINI_CONCURRENCY = int(os.environ.get("MAX_GEMINI_CONCURRENCY", "20"))
 GEMINI_SERVICE_TIER = os.environ.get("GEMINI_SERVICE_TIER", "standard").lower()
 
