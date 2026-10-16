@@ -1,71 +1,71 @@
 import os
+import requests
 from flask import Flask, request, jsonify
-from google import genai
-from google.genai import types
 
 app = Flask(__name__)
 
 @app.route('/process', methods=['POST'])
 def process_media():
+    # Вытаскиваем твой легитимный ключ AQ. из заголовков
     user_api_key = request.headers.get('x-api-key')
     if not user_api_key:
         return jsonify({"error": "Missing personal Google Gemini API Key in Headers"}), 401
 
     try:
-        client = genai.Client(api_key=user_api_key)
-        prompt_context = ""
-        media_contents = []
-
+        # Жесткий системный промпт форматирования (Твой Moat на 23 символа)
         system_instruction = (
             "You are the backend core of VElectronics StudyTool v1. "
-            "Analyze the incoming educational material (audio transcription or macro-image text/diagrams). "
+            "Analyze the incoming educational material. "
             "Provide a high-density academic summary strictly formatted as bullet points. "
             "CRITICAL CONSTRAINT: Each line in your response MUST be strictly under 23 characters long! "
             "Do not exceed 23 characters per line including spaces. Cut or wrap words if needed."
         )
 
-        if 'image' in request.files:
-            image_file = request.files['image'].read()
-            media_contents.append(
-                types.Part.from_bytes(
-                    data=image_file,
-                    mime_type="image/jpeg",
-                )
-            )
-            prompt_context += " Analyze this macro photograph of a textbook/board. Extract and summarize text/diagrams."
+        prompt_context = "Summarize this educational input."
+        
+        # Конструируем чистый JSON по официальной спецификации Google REST API
+        json_payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": prompt_context}
+                    ]
+                }
+            ],
+            "systemInstruction": {
+                "parts": [
+                    {"text": system_instruction}
+                ]
+            },
+            "generationConfig": {
+                "maxOutputTokens": 500,
+                "temperature": 0.3
+            }
+        }
 
-        if 'audio' in request.files:
-            audio_file = request.files['audio'].read()
-            media_contents.append(
-                types.Part.from_bytes(
-                    data=audio_file,
-                    mime_type="audio/wav",
-                )
-            )
-            prompt_context += " Transcribe, clean, and summarize this captured lecture audio segment."
+        # Прямой СВЧ-удар по стабильному эндпоинту Google Gemini 1.5 Flash
+        url = f"https://googleapis.com{user_api_key}"
+        
+        headers = {"Content-Type": "application/json"}
+        response = requests.post(url, json=json_payload, headers=headers)
+        res_data = response.json()
 
-        if not media_contents:
-            return jsonify({"error": "No media payload received"}), 400
-
-        response = client.models.generate_content(
-            model='gemini-1.5-flash',
-            contents=[prompt_context, *media_contents],
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                max_output_tokens=500,
-                temperature=0.3
-            )
-        )
-
-        result_text = response.text if response.text else "Error: Empty AI Response"
-        return jsonify({"text": result_text})
+        # Парсим текстовый ответ из структуры Google JSON
+        if response.status_code == 200:
+            try:
+                result_text = res_data['candidates'][0]['content']['parts'][0]['text']
+                return jsonify({"text": result_text})
+            except KeyError:
+                return jsonify({"error": "Malformed Google API response structure", "raw": res_data}), 500
+        else:
+            return jsonify({"error": "Google API returned an error", "status_code": response.status_code, "details": res_data}), 500
 
     except Exception as e:
         return jsonify({"error": "Internal AI Gateway Processing Error", "details": str(e)}), 500
 
 @app.route('/', methods=['GET'])
 def index():
-    return "VElectronics StudyTool Backend Operating at Python Gold Master Status."
+    return "VElectronics StudyTool Backend Operating at REST Gold Master Status."
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 3000))
