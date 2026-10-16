@@ -6,7 +6,7 @@ app = Flask(__name__)
 
 @app.route('/process', methods=['POST'])
 def process_media():
-    # Твой легитимный ключ AQ. из заголовков платы
+    # Вытаскиваем твой легитимный ключ AQ. из заголовков платы
     user_api_key = request.headers.get('x-api-key')
     if not user_api_key:
         return jsonify({"error": "Missing personal Google Gemini API Key in Headers"}), 401
@@ -23,10 +23,11 @@ def process_media():
 
         prompt_context = "Summarize this educational input."
         
-        # Каноническая структура контента под Vertex-совместимый REST-интерфейс
+        # Конструируем чистый JSON по официальной спецификации Google REST API
         json_payload = {
             "contents": [
                 {
+                    "role": "user",
                     "parts": [
                         {"text": prompt_context}
                     ]
@@ -43,23 +44,31 @@ def process_media():
             }
         }
 
-        # ПУЛЕНЕПРОБИВАЕМЫЙ ЦЕЛЕВОЙ URL ПОД ТВОЙ КЛЮЧ СУФФИКСА AQ.
-        url = f"https://googleapis.com{user_api_key}"
+        # ЖЕСТКИЙ, НЕИЗМЕНЯЕМЫЙ СТАТИЧНЫЙ URL-АДРЕС GOOGLE (Никаких f-строк и подстановок в хост!)
+        url = "https://googleapis.com"
         
-        headers = {"Content-Type": "application/json"}
+        # Передаем ключ в легитимном заголовке x-goog-api-key
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": str(user_api_key).strip()
+        }
+        
+        # Выстреливаем прямым HTTP POST запросом
         response = requests.post(url, json=json_payload, headers=headers)
         
-        print(f"VElectronics Core Status: {response.status_code}")
-
         if response.status_code == 200:
             res_data = response.json()
             try:
                 result_text = res_data['candidates'][0]['content']['parts'][0]['text']
                 return jsonify({"text": result_text})
             except (KeyError, IndexError, TypeError) as parse_err:
-                return jsonify({"error": "Malformed JSON structure", "raw": res_data}), 500
+                return jsonify({"error": "Malformed JSON structure from Google", "raw": res_data, "details": str(parse_err)}), 500
         else:
-            return jsonify({"error": "Google API Reject", "status_code": response.status_code, "raw_text": response.text}), 500
+            try:
+                error_data = response.json()
+                return jsonify({"error": "Google API Reject", "status_code": response.status_code, "details": error_data}), 500
+            except Exception:
+                return jsonify({"error": "Google API Raw Error", "status_code": response.status_code, "text": response.text}), 500
 
     except Exception as e:
         return jsonify({"error": "Internal AI Gateway Processing Error", "details": str(e)}), 500
