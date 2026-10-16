@@ -29,7 +29,7 @@ MODEL_CHAIN = [
 RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
 SYSTEM_INSTRUCTION = (
     "Summarize this educational material in English as concise plain-text lines. "
-    "Each line must be at most 22 "
+    "Each line must be at most 23 "
     "characters including spaces. Do not start lines with bullet symbols."
 )
 
