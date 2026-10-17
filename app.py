@@ -25,8 +25,8 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 3 * 1024 * 1024
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-ENROLLMENT_SECRET = os.environ.get("ENROLLMENT_SECRET", "")
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
+ENROLLMENT_SECRET = os.environ.get("ENROLLMENT_SECRET", "0791554f1186185f6bc11b97e0f744092b3336ad9586cdb058a4296a7dd32547")
+DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://studytool_db_user:W6ATUkjX4gGpSCg96EGu1z7VhtXF9SHM@dpg-db95r859fdbs7392uis0-a/studytool_db")
 GEMINI_AUDIO_MODEL = os.environ.get("GEMINI_AUDIO_MODEL", "gemini-3.8-flash")
 MODEL_CHAIN = os.environ.get(
     "GEMINI_TEXT_MODELS", "gemini-3.8-flash,gemini-3.6-flash,gemini-3.5-flash-lite"
