@@ -81,6 +81,31 @@ def ensure_db():
                 )
             """)
             cur.execute("ALTER TABLE lecture_results ADD COLUMN IF NOT EXISTS state TEXT NOT NULL DEFAULT 'complete'")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS note_qna_sessions (
+                    device_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    note_id TEXT NOT NULL,
+                    chunk_count INTEGER NOT NULL,
+                    question TEXT,
+                    answer TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (device_id, session_id)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS note_qna_chunks (
+                    device_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    chunk_index INTEGER NOT NULL,
+                    content TEXT NOT NULL,
+                    PRIMARY KEY (device_id, session_id, chunk_index),
+                    FOREIGN KEY (device_id, session_id)
+                        REFERENCES note_qna_sessions (device_id, session_id)
+                        ON DELETE CASCADE
+                )
+            """)
+            cur.execute("DELETE FROM note_qna_sessions WHERE created_at < NOW() - INTERVAL '14 days'")
         _db_ready = True
 
 
@@ -610,6 +635,188 @@ def answer_note_question():
         return jsonify({"question": question.strip(), "answer": answer})
     finally:
         _gemini_slots.release()
+
+
+def qna_auth():
+    device_id = request.headers.get("x-device-id", "")
+    token = request.headers.get("x-device-token", "")
+    try:
+        if not authorized(device_id, token):
+            return device_id, (jsonify({"error": "Invalid device credentials"}), 401)
+    except Exception:
+        app.logger.exception("Note Q&A authorization failed")
+        return device_id, (jsonify({"error": "Authorization unavailable"}), 503)
+    return device_id, None
+
+
+@app.post("/notes/qna/session")
+def start_note_qna_session():
+    device_id, failure = qna_auth()
+    if failure:
+        return failure
+    data = request.get_json(silent=True)
+    session_id = data.get("session_id") if isinstance(data, dict) else None
+    note_id = data.get("note_id") if isinstance(data, dict) else None
+    chunk_count = data.get("chunk_count") if isinstance(data, dict) else None
+    if not valid_segment_id(session_id) or not valid_segment_id(note_id):
+        return jsonify({"error": "Invalid session_id or note_id"}), 400
+    if not isinstance(chunk_count, int) or not 1 <= chunk_count <= 32:
+        return jsonify({"error": "chunk_count must be between 1 and 32"}), 400
+    try:
+        with db_connect() as conn, conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO note_qna_sessions (device_id, session_id, note_id, chunk_count)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (device_id, session_id) DO NOTHING
+            """, (device_id, session_id, note_id, chunk_count))
+            cur.execute("""
+                SELECT note_id, chunk_count FROM note_qna_sessions
+                WHERE device_id = %s AND session_id = %s
+            """, (device_id, session_id))
+            row = cur.fetchone()
+        if row is None or row != (note_id, chunk_count):
+            return jsonify({"error": "Session ID conflicts with an existing session"}), 409
+        return jsonify({"session_id": session_id, "chunk_count": chunk_count, "ready": True})
+    except Exception:
+        app.logger.exception("Could not start note Q&A session")
+        return jsonify({"error": "qna_storage_unavailable"}), 503
+
+
+@app.post("/notes/qna/<session_id>/chunk")
+def receive_note_qna_chunk(session_id):
+    device_id, failure = qna_auth()
+    if failure:
+        return failure
+    data = request.get_json(silent=True)
+    index = data.get("index") if isinstance(data, dict) else None
+    total = data.get("total") if isinstance(data, dict) else None
+    content = data.get("content") if isinstance(data, dict) else None
+    if not valid_segment_id(session_id) or not isinstance(index, int) or not isinstance(total, int):
+        return jsonify({"error": "Invalid chunk metadata"}), 400
+    if not isinstance(content, str) or not content.strip() or len(content) > 12000:
+        return jsonify({"error": "Chunk must contain 1 to 12000 characters"}), 400
+    try:
+        with db_connect() as conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT chunk_count FROM note_qna_sessions
+                WHERE device_id = %s AND session_id = %s
+            """, (device_id, session_id))
+            row = cur.fetchone()
+            if row is None:
+                return jsonify({"error": "qna_session_not_found"}), 404
+            if total != row[0] or not 0 <= index < total:
+                return jsonify({"error": "Chunk index or total does not match session"}), 409
+            cur.execute("""
+                INSERT INTO note_qna_chunks (device_id, session_id, chunk_index, content)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (device_id, session_id, chunk_index) DO NOTHING
+            """, (device_id, session_id, index, content))
+            cur.execute("""
+                SELECT content FROM note_qna_chunks
+                WHERE device_id = %s AND session_id = %s AND chunk_index = %s
+            """, (device_id, session_id, index))
+            saved = cur.fetchone()
+            if saved is None or saved[0] != content:
+                return jsonify({"error": "Chunk retry content differs"}), 409
+            cur.execute("""
+                SELECT COUNT(*) FROM note_qna_chunks WHERE device_id = %s AND session_id = %s
+            """, (device_id, session_id))
+            received = cur.fetchone()[0]
+        return jsonify({"ack": True, "index": index, "received": received, "total": total})
+    except Exception:
+        app.logger.exception("Could not store note Q&A chunk")
+        return jsonify({"error": "qna_storage_unavailable"}), 503
+
+
+@app.post("/notes/qna/<session_id>/question")
+def answer_chunked_note_question(session_id):
+    device_id, failure = qna_auth()
+    if failure:
+        return failure
+    if not valid_segment_id(session_id):
+        return jsonify({"error": "Invalid session_id"}), 400
+    image_bytes = None
+    image_mime = "image/jpeg"
+    if request.mimetype == "multipart/form-data":
+        question = request.form.get("question", "")
+        supplied_session = request.form.get("session_id", "")
+        image = request.files.get("image")
+        if supplied_session != session_id:
+            return jsonify({"error": "Session ID mismatch"}), 400
+        if image:
+            image_mime = image.mimetype or ""
+            if image_mime not in {"image/jpeg", "image/png", "image/webp"}:
+                return jsonify({"error": "Image must be JPEG, PNG, or WebP"}), 415
+            image_bytes = image.stream.read(2_500_001)
+            if len(image_bytes) > 2_500_000:
+                return jsonify({"error": "Image exceeds the 2.5 MB limit"}), 413
+            if not image_bytes:
+                return jsonify({"error": "Image file is empty"}), 400
+    else:
+        data = request.get_json(silent=True)
+        question = data.get("question", "") if isinstance(data, dict) else ""
+        supplied_session = data.get("session_id", "") if isinstance(data, dict) else ""
+        if supplied_session != session_id:
+            return jsonify({"error": "Session ID mismatch"}), 400
+    if not isinstance(question, str) or not question.strip() or len(question) > 2000:
+        return jsonify({"error": "A question between 1 and 2000 characters is required"}), 400
+    try:
+        with db_connect() as conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT chunk_count, question, answer FROM note_qna_sessions
+                WHERE device_id = %s AND session_id = %s
+            """, (device_id, session_id))
+            session = cur.fetchone()
+            if session is None:
+                return jsonify({"error": "qna_session_not_found"}), 404
+            if session[2] and session[1] == question.strip():
+                return jsonify({"question": session[1], "answer": session[2], "complete": True})
+            cur.execute("""
+                SELECT chunk_index, content FROM note_qna_chunks
+                WHERE device_id = %s AND session_id = %s ORDER BY chunk_index
+            """, (device_id, session_id))
+            chunks = cur.fetchall()
+        if len(chunks) != session[0] or any(row[0] != i for i, row in enumerate(chunks)):
+            return jsonify({"error": "note_chunks_incomplete", "received": len(chunks), "total": session[0]}), 409
+        context = "".join(row[1] for row in chunks)
+        if not context.strip() or len(context) > 120000:
+            return jsonify({"error": "Lecture context is missing or too large"}), 400
+        if not GEMINI_API_KEY:
+            return jsonify({"error": "gemini_api_key_missing"}), 503
+        if not _gemini_slots.acquire(blocking=False):
+            return jsonify({"error": "ai_busy"}), 429
+        try:
+            answer, error = answer_study_question(question.strip(), context.strip(), image_bytes, image_mime)
+        finally:
+            _gemini_slots.release()
+        if error:
+            app.logger.warning("Study answer generation failed: %s", error)
+            return jsonify({"error": "answer_generation_failed", "detail": str(error)[:300]}), 502
+        with db_connect() as conn, conn.cursor() as cur:
+            cur.execute("""
+                UPDATE note_qna_sessions SET question = %s, answer = %s, created_at = NOW()
+                WHERE device_id = %s AND session_id = %s
+            """, (question.strip(), answer, device_id, session_id))
+        return jsonify({"question": question.strip(), "answer": answer, "complete": True})
+    except Exception:
+        app.logger.exception("Chunked note answer generation failed")
+        return jsonify({"error": "qna_storage_unavailable"}), 503
+
+
+@app.post("/notes/qna/<session_id>/ack")
+def acknowledge_note_qna(session_id):
+    device_id, failure = qna_auth()
+    if failure:
+        return failure
+    if not valid_segment_id(session_id):
+        return jsonify({"error": "Invalid session_id"}), 400
+    try:
+        with db_connect() as conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM note_qna_sessions WHERE device_id = %s AND session_id = %s", (device_id, session_id))
+        return jsonify({"ack": True})
+    except Exception:
+        app.logger.exception("Could not acknowledge note Q&A result")
+        return jsonify({"error": "qna_storage_unavailable"}), 503
 
 
 @app.post("/notes/speech")
