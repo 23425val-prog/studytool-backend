@@ -245,8 +245,10 @@ def little_bat_phrase():
                     avoid.append(clean)
     avoid_normalized = {" ".join(item.casefold().split()) for item in avoid}
 
+    if not GEMINI_API_KEY:
+        return jsonify({"error": "gemini_api_key_missing"}), 503
     if not _gemini_slots.acquire(blocking=False):
-        return jsonify({"error": "AI is busy; try again shortly"}), 503
+        return jsonify({"error": "ai_busy"}), 503
     try:
         previous = json.dumps(avoid, ensure_ascii=False)
         prompt = (
@@ -285,7 +287,23 @@ def little_bat_phrase():
                 )
                 last_error = {"message": "Model repeated a phrase or returned invalid text"}
         app.logger.warning("Little Bat phrase generation failed: %s", last_error)
-        return jsonify({"error": "Could not generate a new phrase"}), 503
+        upstream_status = last_error.get("status") if isinstance(last_error, dict) else None
+        upstream_message = last_error.get("message", "") if isinstance(last_error, dict) else str(last_error or "")
+        if upstream_status == 429:
+            error_code, http_status = "gemini_quota_or_rate_limit", 429
+        elif upstream_status in {401, 403}:
+            error_code, http_status = "gemini_api_key_rejected", 502
+        elif upstream_status == 404:
+            error_code, http_status = "gemini_model_unavailable", 502
+        elif upstream_status == 503:
+            error_code, http_status = "gemini_connection_failed", 503
+        else:
+            error_code, http_status = "gemini_generation_failed", 502
+        if isinstance(upstream_message, dict):
+            detail = json.dumps(upstream_message, ensure_ascii=False)[:240]
+        else:
+            detail = str(upstream_message)[:240]
+        return jsonify({"error": error_code, "detail": detail}), http_status
     finally:
         _gemini_slots.release()
 
