@@ -8,12 +8,15 @@ in lecture_results until the device confirms that it saved the note to microSD.
 
 import base64
 from contextlib import contextmanager
+from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
 import os
 import re
 import secrets
+import smtplib
+from email.message import EmailMessage
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -22,7 +25,7 @@ import requests
 from flask import Flask, Response, jsonify, request
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 12 * 1024 * 1024
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 ENROLLMENT_SECRET = os.environ.get("ENROLLMENT_SECRET", "0791554f1186185f6bc11b97e0f744092b3336ad9586cdb058a4296a7dd32547")
@@ -33,6 +36,12 @@ MODEL_CHAIN = os.environ.get(
     "GEMINI_TEXT_MODELS", "gemini-3.8-flash,gemini-3.6-flash,gemini-3.5-flash-lite"
 ).split(",")
 MAX_GEMINI_CONCURRENCY = int(os.environ.get("MAX_GEMINI_CONCURRENCY", "4"))
+SMTP_HOST = os.environ.get("SMTP_HOST", "")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER)
+APP_TOKEN_SECRET = os.environ.get("APP_TOKEN_SECRET", ENROLLMENT_SECRET)
 RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
 _db_lock = threading.Lock()
 _db_ready = False
@@ -106,11 +115,160 @@ def ensure_db():
                 )
             """)
             cur.execute("DELETE FROM note_qna_sessions WHERE created_at < NOW() - INTERVAL '14 days'")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS app_users (
+                    user_id BIGSERIAL PRIMARY KEY,
+                    email TEXT NOT NULL UNIQUE,
+                    username TEXT NOT NULL UNIQUE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS email_login_codes (
+                    email TEXT PRIMARY KEY,
+                    code_hash TEXT NOT NULL,
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS app_sessions (
+                    token_hash TEXT PRIMARY KEY,
+                    user_id BIGINT NOT NULL REFERENCES app_users(user_id) ON DELETE CASCADE,
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_friends (
+                    user_a BIGINT NOT NULL REFERENCES app_users(user_id) ON DELETE CASCADE,
+                    user_b BIGINT NOT NULL REFERENCES app_users(user_id) ON DELETE CASCADE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY(user_a, user_b), CHECK (user_a < user_b)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS friend_requests (
+                    request_id BIGSERIAL PRIMARY KEY,
+                    sender_id BIGINT NOT NULL REFERENCES app_users(user_id) ON DELETE CASCADE,
+                    receiver_id BIGINT NOT NULL REFERENCES app_users(user_id) ON DELETE CASCADE,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE(sender_id, receiver_id), CHECK (sender_id <> receiver_id)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS shared_notes (
+                    note_id BIGSERIAL PRIMARY KEY,
+                    sender_id BIGINT NOT NULL REFERENCES app_users(user_id) ON DELETE CASCADE,
+                    receiver_id BIGINT NOT NULL REFERENCES app_users(user_id) ON DELETE CASCADE,
+                    title TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    package BYTEA NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS device_profile_links (
+                    device_id TEXT NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,
+                    profile_id TEXT NOT NULL,
+                    user_id BIGINT NOT NULL REFERENCES app_users(user_id) ON DELETE CASCADE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY(device_id, profile_id), UNIQUE(user_id, device_id, profile_id)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS device_profile_pair_codes (
+                    code_hash TEXT PRIMARY KEY,
+                    device_id TEXT NOT NULL,
+                    profile_id TEXT NOT NULL,
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS nfc_friend_tickets (
+                    ticket_hash TEXT PRIMARY KEY,
+                    sender_id BIGINT NOT NULL REFERENCES app_users(user_id) ON DELETE CASCADE,
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    redeemed_by BIGINT REFERENCES app_users(user_id) ON DELETE CASCADE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
         _db_ready = True
 
 
 def hash_token(token):
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def email_code_hash(email, code):
+    secret = APP_TOKEN_SECRET or ""
+    return hmac.new(secret.encode(), f"{email}:{code}".encode(), hashlib.sha256).hexdigest()
+
+
+def pair_code_hash(code):
+    if not APP_TOKEN_SECRET:
+        raise RuntimeError("APP_TOKEN_SECRET is not configured")
+    return hmac.new((APP_TOKEN_SECRET or "").encode(), ("pair:" + code).encode(), hashlib.sha256).hexdigest()
+
+
+def current_app_user():
+    header = request.headers.get("Authorization", "")
+    token = header[7:].strip() if header.lower().startswith("bearer ") else ""
+    if not token:
+        return None
+    ensure_db()
+    with db_connect() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT u.user_id, u.email, u.username
+            FROM app_sessions s JOIN app_users u USING (user_id)
+            WHERE s.token_hash = %s AND s.expires_at > NOW()
+        """, (hash_token(token),))
+        return cur.fetchone()
+
+
+def send_login_code(email, code):
+    if not (SMTP_HOST and SMTP_FROM and APP_TOKEN_SECRET):
+        raise RuntimeError("Email login requires SMTP_HOST, SMTP_FROM, and APP_TOKEN_SECRET")
+    message = EmailMessage()
+    message["Subject"] = "Your StudyTool sign-in code"
+    message["From"] = SMTP_FROM
+    message["To"] = email
+    message.set_content(f"Your StudyTool sign-in code is {code}. It expires in 10 minutes.")
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as smtp:
+        smtp.starttls()
+        if SMTP_USER:
+            smtp.login(SMTP_USER, SMTP_PASSWORD)
+        smtp.send_message(message)
+
+
+def friend_error():
+    user = current_app_user()
+    if user is None:
+        return None, (jsonify({"error": "Sign in required"}), 401)
+    return user, None
+
+
+def device_profile_owner():
+    device_id = request.headers.get("x-device-id", "")
+    device_token = request.headers.get("x-device-token", "")
+    profile_id = request.headers.get("x-profile-id", "")
+    try:
+        if not authorized(device_id, device_token):
+            return None, (jsonify({"error": "Invalid device credentials"}), 401)
+        if not re.fullmatch(r"[a-z0-9_-]{1,24}", profile_id):
+            return None, (jsonify({"error": "Invalid profile id"}), 400)
+        with db_connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT user_id FROM device_profile_links WHERE device_id = %s AND profile_id = %s", (device_id, profile_id))
+            row = cur.fetchone()
+        if not row:
+            return None, (jsonify({"error": "This device profile is not linked to an account"}), 403)
+        return row[0], None
+    except Exception:
+        app.logger.exception("Device profile authorization failed")
+        return None, (jsonify({"error": "Profile authorization unavailable"}), 503)
 
 
 def valid_device_id(value):
@@ -1041,6 +1199,363 @@ def process_text():
 @app.get("/")
 def index():
     return "StudyTool backend is running."
+
+
+@app.post("/account/request-code")
+def account_request_code():
+    data = request.get_json(silent=True) or {}
+    address = str(data.get("email", "")).strip().lower()
+    if len(address) > 254 or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", address):
+        return jsonify({"error": "Enter a valid email address"}), 400
+    try:
+        ensure_db()
+        with db_connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT created_at FROM email_login_codes WHERE email = %s", (address,))
+            row = cur.fetchone()
+            if row and (datetime.now(timezone.utc) - row[0]).total_seconds() < 60:
+                return jsonify({"error": "Wait before requesting another code"}), 429
+            code = f"{secrets.randbelow(1000000):06d}"
+            cur.execute("""
+                INSERT INTO email_login_codes (email, code_hash, expires_at, attempts)
+                VALUES (%s, %s, NOW() + INTERVAL '10 minutes', 0)
+                ON CONFLICT (email) DO UPDATE SET code_hash = EXCLUDED.code_hash,
+                    expires_at = EXCLUDED.expires_at, attempts = 0, created_at = NOW()
+            """, (address, email_code_hash(address, code)))
+        send_login_code(address, code)
+        return jsonify({"status": "sent"})
+    except Exception:
+        app.logger.exception("Could not issue account sign-in code")
+        return jsonify({"error": "Email sign-in is temporarily unavailable"}), 503
+
+
+@app.post("/account/verify-code")
+def account_verify_code():
+    data = request.get_json(silent=True) or {}
+    address = str(data.get("email", "")).strip().lower()
+    code = str(data.get("code", "")).strip()
+    username = str(data.get("username", "")).strip().lower()
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", address) or not re.fullmatch(r"\d{6}", code):
+        return jsonify({"error": "Invalid email or code"}), 400
+    if username and not re.fullmatch(r"[a-z0-9_]{3,24}", username):
+        return jsonify({"error": "Username must be 3–24 letters, numbers, or underscores"}), 400
+    try:
+        ensure_db()
+        with db_connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT code_hash, expires_at, attempts FROM email_login_codes WHERE email = %s", (address,))
+            row = cur.fetchone()
+            if not row or row[1] <= datetime.now(timezone.utc) or row[2] >= 5:
+                return jsonify({"error": "Code expired. Request a new one."}), 400
+            if not hmac.compare_digest(row[0], email_code_hash(address, code)):
+                cur.execute("UPDATE email_login_codes SET attempts = attempts + 1 WHERE email = %s", (address,))
+                return jsonify({"error": "Incorrect sign-in code"}), 400
+            cur.execute("SELECT user_id, username FROM app_users WHERE email = %s", (address,))
+            account = cur.fetchone()
+            if account is None:
+                if not username:
+                    return jsonify({"error": "Choose a username to finish creating your account"}), 400
+                cur.execute("INSERT INTO app_users (email, username) VALUES (%s, %s) ON CONFLICT DO NOTHING RETURNING user_id", (address, username))
+                created = cur.fetchone()
+                if created is None:
+                    return jsonify({"error": "That username is already taken"}), 409
+                user_id = created[0]
+            else:
+                user_id = account[0]
+            cur.execute("DELETE FROM email_login_codes WHERE email = %s", (address,))
+            token = secrets.token_urlsafe(32)
+            cur.execute("""
+                INSERT INTO app_sessions (token_hash, user_id, expires_at)
+                VALUES (%s, %s, NOW() + INTERVAL '30 days')
+            """, (hash_token(token), user_id))
+            cur.execute("SELECT username FROM app_users WHERE user_id = %s", (user_id,))
+            saved_username = cur.fetchone()[0]
+        return jsonify({"token": token, "username": saved_username, "email": address})
+    except Exception:
+        app.logger.exception("Could not verify account sign-in code")
+        return jsonify({"error": "Could not sign in"}), 503
+
+
+@app.get("/account/me")
+def account_me():
+    user, failure = friend_error()
+    if failure:
+        return failure
+    return jsonify({"username": user[2], "email": user[1]})
+
+
+@app.post("/device/profiles/pair-code")
+def create_profile_pair_code():
+    device_id = request.headers.get("x-device-id", "")
+    device_token = request.headers.get("x-device-token", "")
+    data = request.get_json(silent=True) or {}
+    profile_id = str(data.get("profile_id", ""))
+    if not authorized(device_id, device_token):
+        return jsonify({"error": "Invalid device credentials"}), 401
+    if not re.fullmatch(r"[a-z0-9_-]{1,24}", profile_id):
+        return jsonify({"error": "Invalid profile id"}), 400
+    if not APP_TOKEN_SECRET:
+        return jsonify({"error": "Profile linking is not configured on the server"}), 503
+    code = f"{secrets.randbelow(1000000):06d}"
+    code_hash = pair_code_hash(code)
+    try:
+        with db_connect() as conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM device_profile_pair_codes WHERE device_id = %s AND profile_id = %s", (device_id, profile_id))
+            cur.execute("""
+                INSERT INTO device_profile_pair_codes(code_hash, device_id, profile_id, expires_at)
+                VALUES (%s, %s, %s, NOW() + INTERVAL '10 minutes')
+            """, (code_hash, device_id, profile_id))
+        return jsonify({"code": code, "expires_in": 600})
+    except Exception:
+        app.logger.exception("Could not create profile pairing code")
+        return jsonify({"error": "Could not create pairing code"}), 503
+
+
+@app.post("/account/link-device-profile")
+def link_device_profile():
+    user, failure = friend_error()
+    if failure:
+        return failure
+    data = request.get_json(silent=True) or {}
+    code = str(data.get("code", "")).strip()
+    if not re.fullmatch(r"\d{6}", code):
+        return jsonify({"error": "Enter the six-digit code shown on StudyTool"}), 400
+    try:
+        with db_connect() as conn, conn.cursor() as cur:
+            code_hash = pair_code_hash(code)
+            cur.execute("""
+                SELECT code_hash, device_id, profile_id FROM device_profile_pair_codes
+                WHERE code_hash = %s AND expires_at > NOW() FOR UPDATE
+            """, (code_hash,))
+            selected = cur.fetchone()
+            if not selected:
+                return jsonify({"error": "Pairing code is invalid or expired"}), 400
+            code_hash, device_id, profile_id = selected
+            cur.execute("""
+                INSERT INTO device_profile_links(device_id, profile_id, user_id)
+                VALUES (%s, %s, %s) ON CONFLICT(device_id, profile_id)
+                DO UPDATE SET user_id = EXCLUDED.user_id, created_at = NOW()
+            """, (device_id, profile_id, user[0]))
+            cur.execute("DELETE FROM device_profile_pair_codes WHERE code_hash = %s", (code_hash,))
+        return jsonify({"status": "linked", "profile_id": profile_id})
+    except Exception:
+        app.logger.exception("Could not link device profile")
+        return jsonify({"error": "Could not link device profile"}), 503
+
+
+@app.post("/device/friends/nfc-ticket")
+def create_nfc_friend_ticket():
+    sender_id, failure = device_profile_owner()
+    if failure:
+        return failure
+    ticket = secrets.token_urlsafe(24)
+    try:
+        with db_connect() as conn, conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO nfc_friend_tickets(ticket_hash, sender_id, expires_at)
+                VALUES (%s, %s, NOW() + INTERVAL '5 minutes')
+            """, (hash_token(ticket), sender_id))
+        return jsonify({"ticket": ticket, "expires_in": 300})
+    except Exception:
+        app.logger.exception("Could not create NFC friend ticket")
+        return jsonify({"error": "Could not create NFC friend ticket"}), 503
+
+
+@app.post("/device/friends/nfc-redeem")
+def redeem_nfc_friend_ticket():
+    receiver_id, failure = device_profile_owner()
+    if failure:
+        return failure
+    data = request.get_json(silent=True) or {}
+    ticket = str(data.get("ticket", ""))
+    if not re.fullmatch(r"[A-Za-z0-9_-]{24,80}", ticket):
+        return jsonify({"error": "Invalid NFC invitation"}), 400
+    try:
+        with db_connect() as conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT sender_id FROM nfc_friend_tickets
+                WHERE ticket_hash = %s AND expires_at > NOW() AND redeemed_by IS NULL FOR UPDATE
+            """, (hash_token(ticket),))
+            row = cur.fetchone()
+            if not row:
+                return jsonify({"error": "NFC invitation expired or already used"}), 400
+            sender_id = row[0]
+            if sender_id == receiver_id:
+                return jsonify({"error": "This invitation belongs to the same account"}), 400
+            a, b = sorted((sender_id, receiver_id))
+            cur.execute("SELECT 1 FROM user_friends WHERE user_a = %s AND user_b = %s", (a, b))
+            if cur.fetchone():
+                cur.execute("UPDATE nfc_friend_tickets SET redeemed_by = %s WHERE ticket_hash = %s", (receiver_id, hash_token(ticket)))
+                return jsonify({"status": "already_friends"}), 200
+            cur.execute("""
+                INSERT INTO friend_requests(sender_id, receiver_id) VALUES (%s, %s)
+                ON CONFLICT (sender_id, receiver_id) DO UPDATE SET status = 'pending', created_at = NOW()
+            """, (sender_id, receiver_id))
+            cur.execute("UPDATE nfc_friend_tickets SET redeemed_by = %s WHERE ticket_hash = %s", (receiver_id, hash_token(ticket)))
+        return jsonify({"status": "request_received"}), 201
+    except Exception:
+        app.logger.exception("Could not redeem NFC friend ticket")
+        return jsonify({"error": "Could not process NFC invitation"}), 503
+
+
+@app.post("/friends/requests")
+def create_friend_request():
+    user, failure = friend_error()
+    if failure:
+        return failure
+    data = request.get_json(silent=True) or {}
+    username = str(data.get("username", "")).strip().lower()
+    if not re.fullmatch(r"[a-z0-9_]{3,24}", username):
+        return jsonify({"error": "Enter a valid username"}), 400
+    try:
+        with db_connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT user_id FROM app_users WHERE username = %s", (username,))
+            target = cur.fetchone()
+            if not target:
+                return jsonify({"error": "No account found for that username"}), 404
+            if target[0] == user[0]:
+                return jsonify({"error": "You cannot add yourself"}), 400
+            a, b = sorted((user[0], target[0]))
+            cur.execute("SELECT 1 FROM user_friends WHERE user_a = %s AND user_b = %s", (a, b))
+            if cur.fetchone():
+                return jsonify({"error": "You are already friends"}), 409
+            # If the other person already invited this user, accept that request
+            # instead of leaving two contradictory pending requests.
+            cur.execute("""
+                SELECT request_id FROM friend_requests
+                WHERE sender_id = %s AND receiver_id = %s AND status = 'pending'
+                FOR UPDATE
+            """, (target[0], user[0]))
+            reverse_request = cur.fetchone()
+            if reverse_request:
+                cur.execute("INSERT INTO user_friends(user_a, user_b) VALUES (%s, %s) ON CONFLICT DO NOTHING", (a, b))
+                cur.execute("UPDATE friend_requests SET status = 'accepted' WHERE request_id = %s", (reverse_request[0],))
+                return jsonify({"status": "accepted", "username": username}), 200
+            cur.execute("""
+                INSERT INTO friend_requests(sender_id, receiver_id) VALUES (%s, %s)
+                ON CONFLICT (sender_id, receiver_id) DO UPDATE
+                  SET status = 'pending', created_at = NOW()
+                RETURNING request_id
+            """, (user[0], target[0]))
+            request_id = cur.fetchone()[0]
+        return jsonify({"request_id": request_id, "status": "pending"}), 201
+    except Exception:
+        app.logger.exception("Could not create friend request")
+        return jsonify({"error": "Friend request failed"}), 503
+
+
+@app.get("/friends")
+def get_friends():
+    user, failure = friend_error()
+    if failure:
+        return failure
+    with db_connect() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT u.user_id, u.username FROM user_friends f JOIN app_users u
+              ON u.user_id = CASE WHEN f.user_a = %s THEN f.user_b ELSE f.user_a END
+            WHERE f.user_a = %s OR f.user_b = %s ORDER BY u.username
+        """, (user[0], user[0], user[0]))
+        rows = cur.fetchall()
+    return jsonify({"friends": [{"id": row[0], "username": row[1]} for row in rows]})
+
+
+@app.get("/friends/requests")
+def get_friend_requests():
+    user, failure = friend_error()
+    if failure:
+        return failure
+    with db_connect() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT r.request_id, r.sender_id, s.username, r.receiver_id, t.username,
+                   r.status, r.created_at
+            FROM friend_requests r JOIN app_users s ON s.user_id = r.sender_id
+            JOIN app_users t ON t.user_id = r.receiver_id
+            WHERE (r.sender_id = %s OR r.receiver_id = %s) AND r.status = 'pending'
+            ORDER BY r.created_at DESC
+        """, (user[0], user[0]))
+        rows = cur.fetchall()
+    return jsonify({"requests": [{"id": r[0], "direction": "incoming" if r[3] == user[0] else "outgoing",
+        "username": r[2] if r[3] == user[0] else r[4], "created_at": r[6].isoformat()} for r in rows]})
+
+
+@app.post("/friends/requests/<int:request_id>/<action>")
+def decide_friend_request(request_id, action):
+    user, failure = friend_error()
+    if failure:
+        return failure
+    if action not in {"accept", "decline"}:
+        return jsonify({"error": "Unknown request action"}), 404
+    try:
+        with db_connect() as conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT sender_id, receiver_id FROM friend_requests
+                WHERE request_id = %s AND receiver_id = %s AND status = 'pending' FOR UPDATE
+            """, (request_id, user[0]))
+            row = cur.fetchone()
+            if not row:
+                return jsonify({"error": "Friend request not found"}), 404
+            sender_id, receiver_id = row
+            if action == "accept":
+                a, b = sorted((sender_id, receiver_id))
+                cur.execute("INSERT INTO user_friends(user_a, user_b) VALUES (%s, %s) ON CONFLICT DO NOTHING", (a, b))
+            cur.execute("UPDATE friend_requests SET status = %s WHERE request_id = %s", ("accepted" if action == "accept" else "declined", request_id))
+        return jsonify({"status": action + "ed" if action == "accept" else "declined"})
+    except Exception:
+        app.logger.exception("Could not update friend request")
+        return jsonify({"error": "Could not update friend request"}), 503
+
+
+@app.post("/friends/<int:friend_id>/notes")
+def share_note_with_friend(friend_id):
+    user, failure = friend_error()
+    if failure:
+        return failure
+    a, b = sorted((user[0], friend_id))
+    title = " ".join(request.headers.get("x-note-title", "StudyTool note").split())[:120]
+    filename = re.sub(r"[^A-Za-z0-9._-]", "_", request.headers.get("x-note-filename", "note.zip"))[:100]
+    package = request.get_data(cache=False)
+    if not package.startswith(b"PK\x03\x04"):
+        return jsonify({"error": "Expected a ZIP note package"}), 415
+    if len(package) > 9 * 1024 * 1024:
+        return jsonify({"error": "Note package exceeds 9 MB"}), 413
+    with db_connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM user_friends WHERE user_a = %s AND user_b = %s", (a, b))
+        if not cur.fetchone():
+            return jsonify({"error": "Notes can only be shared with accepted friends"}), 403
+        cur.execute("""
+            INSERT INTO shared_notes(sender_id, receiver_id, title, filename, package)
+            VALUES (%s, %s, %s, %s, %s) RETURNING note_id
+        """, (user[0], friend_id, title, filename, psycopg2.Binary(package)))
+        note_id = cur.fetchone()[0]
+    return jsonify({"note_id": note_id, "status": "shared"}), 201
+
+
+@app.get("/friends/notes")
+def list_shared_notes():
+    user, failure = friend_error()
+    if failure:
+        return failure
+    with db_connect() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT n.note_id, n.title, n.filename, u.username, n.created_at
+            FROM shared_notes n JOIN app_users u ON u.user_id = n.sender_id
+            WHERE n.receiver_id = %s ORDER BY n.created_at DESC
+        """, (user[0],))
+        rows = cur.fetchall()
+    return jsonify({"notes": [{"id": r[0], "title": r[1], "filename": r[2], "from": r[3], "created_at": r[4].isoformat()} for r in rows]})
+
+
+@app.get("/friends/notes/<int:note_id>")
+def download_shared_note(note_id):
+    user, failure = friend_error()
+    if failure:
+        return failure
+    with db_connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT filename, package FROM shared_notes WHERE note_id = %s AND receiver_id = %s", (note_id, user[0]))
+        row = cur.fetchone()
+    if not row:
+        return jsonify({"error": "Shared note not found"}), 404
+    response = Response(bytes(row[1]), mimetype="application/zip")
+    response.headers["Content-Disposition"] = f'attachment; filename="{row[0]}"'
+    return response
 
 
 if __name__ == "__main__":
