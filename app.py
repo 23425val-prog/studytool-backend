@@ -28,8 +28,8 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 12 * 1024 * 1024
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-ENROLLMENT_SECRET = os.environ.get("ENROLLMENT_SECRET", "0791554f1186185f6bc11b97e0f744092b3336ad9586cdb058a4296a7dd32547")
-DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://studytool_db_user:W6ATUkjX4gGpSCg96EGu1z7VhtXF9SHM@dpg-db95r859fdbs7392uis0-a/studytool_db")
+ENROLLMENT_SECRET = os.environ.get("ENROLLMENT_SECRET", "")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 GEMINI_AUDIO_MODEL = os.environ.get("GEMINI_AUDIO_MODEL", "gemini-3.8-flash")
 GEMINI_TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.8-flash-lite-tts")
 MODEL_CHAIN = os.environ.get(
@@ -641,7 +641,9 @@ def little_bat_phrase():
             "generationConfig": {"temperature": 1.0, "maxOutputTokens": 80},
         }
         last_error = None
-        for model in MODEL_CHAIN[:2]:
+        # Try every configured text model; the last model is a real fallback
+        # when the preferred Gemini endpoint is unavailable or rate-limited.
+        for model in MODEL_CHAIN:
             model = model.strip()
             if not model:
                 continue
