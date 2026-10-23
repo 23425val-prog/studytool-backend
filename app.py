@@ -311,7 +311,7 @@ def result_for(device_id, segment_id):
     return {"segment_id": segment_id, "transcript": row[0], "notes": row[1], "title": row[2], "model": row[3], "state": row[4]}
 
 
-def gemini_request(model, payload):
+def gemini_request(model, payload, timeout=(5, 180)):
     if not GEMINI_API_KEY:
         return None, {"status": 503, "message": "GEMINI_API_KEY is not configured"}
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -320,7 +320,7 @@ def gemini_request(model, payload):
             url,
             json=payload,
             headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
-            timeout=(5, 180),
+            timeout=timeout,
         )
     except requests.RequestException as exc:
         return None, {"status": 503, "message": str(exc)}
@@ -641,8 +641,10 @@ def little_bat_phrase():
             model = model.strip()
             if not model:
                 continue
-            for _ in range(2):
-                text, error = gemini_request(model, payload)
+            # Keep the phrase endpoint bounded and move to a fallback model
+            # after one short request instead of repeating long generations.
+            for _ in range(1):
+                text, error = gemini_request(model, payload, timeout=(4, 15))
                 if error is not None:
                     last_error = error
                     if error.get("status") not in RETRYABLE_STATUSES | {404}:
@@ -672,6 +674,8 @@ def little_bat_phrase():
             error_code, http_status = "gemini_model_unavailable", 502
         elif upstream_status == 503:
             error_code, http_status = "gemini_connection_failed", 503
+        elif upstream_status in {500, 502, 504}:
+            error_code, http_status = "gemini_temporarily_unavailable", 503
         else:
             error_code, http_status = "gemini_generation_failed", 502
         if isinstance(upstream_message, dict):
@@ -679,6 +683,9 @@ def little_bat_phrase():
         else:
             detail = str(upstream_message)[:240]
         return jsonify({"error": error_code, "detail": detail}), http_status
+    except Exception:
+        app.logger.exception("Little Bat phrase endpoint failed unexpectedly")
+        return jsonify({"error": "phrase_service_error"}), 503
     finally:
         _gemini_slots.release()
 
