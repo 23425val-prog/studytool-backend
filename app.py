@@ -322,8 +322,12 @@ def gemini_request(model, payload, timeout=(5, 180)):
             headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
             timeout=timeout,
         )
+    except requests.Timeout as exc:
+        return None, {"status": 504, "kind": "timeout", "message": str(exc)}
+    except requests.ConnectionError as exc:
+        return None, {"status": 503, "kind": "connection", "message": str(exc)}
     except requests.RequestException as exc:
-        return None, {"status": 503, "message": str(exc)}
+        return None, {"status": 502, "kind": "request", "message": str(exc)}
     if not response.ok:
         try:
             error = response.json()
@@ -637,16 +641,21 @@ def little_bat_phrase():
             "generationConfig": {"temperature": 1.0, "maxOutputTokens": 80},
         }
         last_error = None
-        for model in MODEL_CHAIN:
+        for model in MODEL_CHAIN[:2]:
             model = model.strip()
             if not model:
                 continue
             # Keep the phrase endpoint bounded and move to a fallback model
             # after one short request instead of repeating long generations.
             for _ in range(1):
-                text, error = gemini_request(model, payload, timeout=(4, 15))
+                text, error = gemini_request(model, payload, timeout=(4, 25))
                 if error is not None:
                     last_error = error
+                    app.logger.warning(
+                        "Little Bat Gemini attempt failed model=%s status=%s kind=%s detail=%s",
+                        model, error.get("status"), error.get("kind", "upstream"),
+                        str(error.get("message", ""))[:240],
+                    )
                     if error.get("status") not in RETRYABLE_STATUSES | {404}:
                         break
                     continue
@@ -665,6 +674,7 @@ def little_bat_phrase():
                 last_error = {"message": "Model repeated a phrase or returned invalid text"}
         app.logger.warning("Little Bat phrase generation failed: %s", last_error)
         upstream_status = last_error.get("status") if isinstance(last_error, dict) else None
+        error_kind = last_error.get("kind") if isinstance(last_error, dict) else None
         upstream_message = last_error.get("message", "") if isinstance(last_error, dict) else str(last_error or "")
         if upstream_status == 429:
             error_code, http_status = "gemini_quota_or_rate_limit", 429
@@ -672,9 +682,11 @@ def little_bat_phrase():
             error_code, http_status = "gemini_api_key_rejected", 502
         elif upstream_status == 404:
             error_code, http_status = "gemini_model_unavailable", 502
-        elif upstream_status == 503:
+        elif error_kind == "timeout":
+            error_code, http_status = "gemini_timeout", 504
+        elif error_kind == "connection":
             error_code, http_status = "gemini_connection_failed", 503
-        elif upstream_status in {500, 502, 504}:
+        elif upstream_status in {500, 502, 503, 504}:
             error_code, http_status = "gemini_temporarily_unavailable", 503
         else:
             error_code, http_status = "gemini_generation_failed", 502
