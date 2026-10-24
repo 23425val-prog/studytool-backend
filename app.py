@@ -341,10 +341,41 @@ def gemini_request(model, payload, timeout=(5, 180)):
             error = {"message": response.text[:1000]}
         return None, {"status": response.status_code, "message": error}
     try:
-        text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
+        result = response.json()
+    except ValueError as exc:
+        return None, {"status": 502, "message": f"Gemini returned invalid JSON: {exc}"}
+
+    # A successful HTTP response may still contain no candidate text. Preserve
+    # provider finish/block metadata so retries and logs reveal the real cause.
+    candidates = result.get("candidates", []) if isinstance(result, dict) else []
+    text_parts = []
+    finish_reasons = []
+    candidate_keys = []
+    if isinstance(candidates, list):
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            candidate_keys.append(sorted(candidate.keys()))
+            finish_reasons.append(candidate.get("finishReason"))
+            content = candidate.get("content") or {}
+            parts = content.get("parts", []) if isinstance(content, dict) else []
+            if isinstance(parts, list):
+                for part in parts:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        text_parts.append(part["text"])
+    text = "\n".join(part for part in text_parts if part.strip()).strip()
+    if text:
         return text, None
-    except (ValueError, KeyError, IndexError, TypeError) as exc:
-        return None, {"status": 502, "message": f"Gemini returned no text: {exc}"}
+    prompt_feedback = result.get("promptFeedback") if isinstance(result, dict) else None
+    return None, {
+        "status": 502,
+        "message": {
+            "reason": "Gemini returned no text",
+            "finish_reasons": finish_reasons,
+            "prompt_feedback": prompt_feedback,
+            "candidate_keys": candidate_keys,
+        },
+    }
 
 
 def transcribe_wav(audio_bytes):
