@@ -350,12 +350,35 @@ def gemini_request(model, payload, timeout=(5, 180)):
 def transcribe_wav(audio_bytes):
     payload = {
         "contents": [{"role": "user", "parts": [
-            {"text": "Transcribe all audible speech verbatim in its original language. Return only the transcript. If there is no intelligible speech, return an empty string."},
+            {"text": "Transcribe all audible speech faithfully and completely. Always write the transcript in English. If speech is in another language, translate it into natural English while preserving meaning, names, numbers, technical terms, examples, and speaker intent. Do not summarize, omit, or add anything. Return only the English transcript. If there is no intelligible speech, return an empty string."},
             {"inlineData": {"mimeType": "audio/wav", "data": base64.b64encode(audio_bytes).decode("ascii")}},
         ]}],
         "generationConfig": {"temperature": 0.1, "maxOutputTokens": 8192},
     }
-    return gemini_request(GEMINI_AUDIO_MODEL, payload, timeout=(5, 150))
+    models = []
+    for model in [GEMINI_AUDIO_MODEL] + MODEL_CHAIN:
+        model = model.strip()
+        if model and model not in models:
+            models.append(model)
+        if len(models) >= 3:
+            break
+    last_error = None
+    for model in models:
+        # A transient provider 503 has occurred on this endpoint. Retry it once,
+        # then use a second supported model instead of failing the whole minute.
+        for attempt in range(2):
+            text, error = gemini_request(model, payload, timeout=(5, 60))
+            if error is None and text and text.strip():
+                app.logger.info("Lecture transcription succeeded with model=%s", model)
+                return text, None
+            last_error = error or {"message": "Gemini returned an empty transcript"}
+            app.logger.warning("Lecture transcription failed model=%s attempt=%d error=%s",
+                              model, attempt + 1, last_error)
+            if attempt == 0 and error and error.get("status") in {429, 500, 502, 503}:
+                time.sleep(2)
+                continue
+            break
+    return None, last_error or {"message": "No audio transcription model succeeded"}
 
 
 def answer_study_question(question, context, image_bytes=None, image_mime="image/jpeg"):
@@ -527,8 +550,10 @@ def make_speech_pcm(text):
 
 def make_notes(transcript):
     prompt = (
-        "Create accurate, comprehensive study notes from this lecture transcript segment. "
+        "Write comprehensive, detailed study notes in English from this lecture transcript segment. "
         "This is one segment of a longer lecture, so it may begin or end mid-topic. "
+        "The transcript may have been translated from another language; the notes must still be entirely in English. "
+        "These are full study notes, not a short summary. Preserve all useful information from the segment. "
         "Return only a valid JSON object with exactly two string fields: title (a short, "
         "descriptive lecture title, ideally 3-7 words) and notes (the study notes).\n\n"
         "Accuracy and coverage rules:\n"
@@ -539,9 +564,9 @@ def make_notes(transcript):
         "formulas, and technical terms when present. Keep numbers and relationships exact.\n"
         "- Organize the content with helpful plain-text headings and bullets where useful. "
         "Combine repetition only when no meaning or emphasis is lost.\n"
-        "- Write the title and notes in English. If the transcript is in another language, "
-        "translate faithfully and retain an original-language technical term in parentheses "
-        "when translation could lose precision. Correct obvious transcription punctuation "
+        "- Write every title and note sentence in English, even when the lecturer speaks another language. "
+        "Translate faithfully and retain an original-language technical term in parentheses "
+        "only when translation could lose precision. Correct obvious transcription punctuation "
         "and grammar without changing meaning.\n"
         "- Do not add outside knowledge, assumptions, or facts. Do not silently guess "
         "unclear names, numbers, or terms; mark materially unclear audio as [unclear].\n"
