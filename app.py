@@ -50,6 +50,34 @@ _gemini_slots = threading.BoundedSemaphore(MAX_GEMINI_CONCURRENCY)
 _audio_jobs = ThreadPoolExecutor(max_workers=MAX_GEMINI_CONCURRENCY)
 
 
+_QUESTION_JOB_TTL_SECONDS = 600
+_question_transcription_lock = threading.Lock()
+_question_transcription_jobs = {}
+
+
+def _run_question_transcription(job_id, device_id, audio):
+    try:
+        text, error = transcribe_wav(audio)
+        if error:
+            app.logger.warning("Question transcription failed job=%s: %s", job_id, error)
+            result = {"state": "failed", "error": "question_transcription_failed"}
+        else:
+            question = (text or "").strip()
+            result = ({"state": "complete", "question": question} if question
+                      else {"state": "failed", "error": "no_speech_detected"})
+    except Exception:
+        app.logger.exception("Question transcription crashed job=%s", job_id)
+        result = {"state": "failed", "error": "question_transcription_failed"}
+    finally:
+        _gemini_slots.release()
+    with _question_transcription_lock:
+        job = _question_transcription_jobs.get(job_id)
+        if job and job["device_id"] == device_id:
+            job.update(result)
+
+
+
+
 @contextmanager
 def db_connect():
     if not DATABASE_URL:
@@ -806,17 +834,53 @@ def transcribe_note_question():
         return jsonify({"error": "gemini_api_key_missing"}), 503
     if not _gemini_slots.acquire(blocking=False):
         return jsonify({"error": "ai_busy"}), 429
+    job_id = secrets.token_urlsafe(18)
+    now = time.monotonic()
+    with _question_transcription_lock:
+        expired = [key for key, job in _question_transcription_jobs.items()
+                   if now - job["created"] > _QUESTION_JOB_TTL_SECONDS]
+        for key in expired:
+            _question_transcription_jobs.pop(key, None)
+        _question_transcription_jobs[job_id] = {
+            "device_id": device_id, "state": "processing", "created": now}
     try:
-        text, error = transcribe_wav(audio)
-        if error:
-            app.logger.warning("Question transcription failed: %s", error)
-            return jsonify({"error": "question_transcription_failed", "detail": str(error)[:300]}), 502
-        question = (text or "").strip()
-        if not question:
-            return jsonify({"error": "no_speech_detected"}), 422
-        return jsonify({"question": question})
-    finally:
+        _audio_jobs.submit(_run_question_transcription, job_id, device_id, audio)
+    except Exception:
         _gemini_slots.release()
+        with _question_transcription_lock:
+            _question_transcription_jobs.pop(job_id, None)
+        app.logger.exception("Could not enqueue question transcription")
+        return jsonify({"error": "question_transcription_unavailable"}), 503
+    return jsonify({"job_id": job_id, "state": "processing"}), 202
+
+
+@app.get("/notes/question/transcribe/<job_id>")
+def question_transcription_status(job_id):
+    device_id = request.headers.get("x-device-id", "")
+    token = request.headers.get("x-device-token", "")
+    try:
+        if not authorized(device_id, token):
+            return jsonify({"error": "Invalid device credentials"}), 401
+    except Exception:
+        app.logger.exception("Question transcription status authorization failed")
+        return jsonify({"error": "Authorization unavailable"}), 503
+    now = time.monotonic()
+    with _question_transcription_lock:
+        expired = [key for key, job in _question_transcription_jobs.items()
+                   if now - job["created"] > _QUESTION_JOB_TTL_SECONDS]
+        for key in expired:
+            _question_transcription_jobs.pop(key, None)
+        job = _question_transcription_jobs.get(job_id)
+        if job is None or job["device_id"] != device_id:
+            return jsonify({"error": "transcription_job_not_found"}), 404
+        snapshot = dict(job)
+    if snapshot["state"] == "processing":
+        return jsonify({"job_id": job_id, "state": "processing"}), 202
+    if snapshot["state"] == "complete":
+        return jsonify({"job_id": job_id, "state": "complete",
+                        "question": snapshot["question"]})
+    return jsonify({"job_id": job_id, "state": "failed",
+                    "error": snapshot.get("error", "question_transcription_failed")}), 502
 
 
 @app.post("/notes/ask")
