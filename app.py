@@ -16,6 +16,7 @@ import os
 import re
 import secrets
 import smtplib
+import time
 from email.message import EmailMessage
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -85,11 +86,13 @@ def ensure_db():
                     title TEXT NOT NULL,
                     model TEXT NOT NULL,
                     state TEXT NOT NULL DEFAULT 'complete',
+                    error TEXT,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     PRIMARY KEY (device_id, segment_id)
                 )
             """)
             cur.execute("ALTER TABLE lecture_results ADD COLUMN IF NOT EXISTS state TEXT NOT NULL DEFAULT 'complete'")
+            cur.execute("ALTER TABLE lecture_results ADD COLUMN IF NOT EXISTS error TEXT")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS note_qna_sessions (
                     device_id TEXT NOT NULL,
@@ -294,13 +297,13 @@ def result_for(device_id, segment_id):
     # stale jobs failed instead of leaving a device waiting forever.
     with db_connect() as conn, conn.cursor() as cur:
         cur.execute("""
-            UPDATE lecture_results SET state = 'failed', created_at = NOW()
+            UPDATE lecture_results SET state = 'failed', error = 'Background processing expired after server restart', created_at = NOW()
             WHERE device_id = %s AND segment_id = %s AND state = 'processing'
               AND created_at < NOW() - INTERVAL '20 minutes'
         """, (device_id, segment_id))
     with db_connect() as conn, conn.cursor() as cur:
         cur.execute("""
-            SELECT transcript, notes, title, model, state
+            SELECT transcript, notes, title, model, state, error
             FROM lecture_results WHERE device_id = %s AND segment_id = %s
         """, (device_id, segment_id))
         row = cur.fetchone()
@@ -308,7 +311,10 @@ def result_for(device_id, segment_id):
         return None
     if row[4] == "processing":
         return {"segment_id": segment_id, "state": "processing"}
-    return {"segment_id": segment_id, "transcript": row[0], "notes": row[1], "title": row[2], "model": row[3], "state": row[4]}
+    result = {"segment_id": segment_id, "transcript": row[0], "notes": row[1], "title": row[2], "model": row[3], "state": row[4]}
+    if row[4] == "failed" and row[5]:
+        result["error"] = row[5]
+    return result
 
 
 def gemini_request(model, payload, timeout=(5, 180)):
@@ -349,7 +355,7 @@ def transcribe_wav(audio_bytes):
         ]}],
         "generationConfig": {"temperature": 0.1, "maxOutputTokens": 8192},
     }
-    return gemini_request(GEMINI_AUDIO_MODEL, payload)
+    return gemini_request(GEMINI_AUDIO_MODEL, payload, timeout=(5, 150))
 
 
 def answer_study_question(question, context, image_bytes=None, image_mime="image/jpeg"):
@@ -555,7 +561,7 @@ def make_notes(transcript):
         model = model.strip()
         if not model:
             continue
-        text, error = gemini_request(model, payload)
+        text, error = gemini_request(model, payload, timeout=(5, 60))
         if error is None:
             try:
                 parsed = json.loads(text)
@@ -577,17 +583,17 @@ def save_result(device_id, segment_id, result):
     with db_connect() as conn, conn.cursor() as cur:
         cur.execute("""
             UPDATE lecture_results SET transcript = %s, notes = %s, title = %s,
-                model = %s, state = 'complete', created_at = NOW()
+                model = %s, state = 'complete', error = NULL, created_at = NOW()
             WHERE device_id = %s AND segment_id = %s
         """, (result["transcript"], result["notes"], result["title"], result["model"], device_id, segment_id))
     return result_for(device_id, segment_id)
 
 
-def set_result_failed(device_id, segment_id):
+def set_result_failed(device_id, segment_id, reason="Processing failed; check backend logs"):
     try:
         with db_connect() as conn, conn.cursor() as cur:
-            cur.execute("UPDATE lecture_results SET state = 'failed', created_at = NOW() WHERE device_id = %s AND segment_id = %s",
-                        (device_id, segment_id))
+            cur.execute("UPDATE lecture_results SET state = 'failed', error = %s, created_at = NOW() WHERE device_id = %s AND segment_id = %s",
+                        (str(reason)[:1000], device_id, segment_id))
     except Exception:
         app.logger.exception("Could not mark lecture segment failed")
 
@@ -1111,7 +1117,7 @@ def process_audio():
             if existing.get("state") == "processing":
                 return jsonify(existing), 202
             if existing.get("state") == "failed":
-                return jsonify({"error": "Segment processing failed"}), 410
+                return jsonify({"error": "Segment processing failed", "detail": existing.get("error", "No failure detail was stored")}), 410
             return jsonify(existing)
         _audio_jobs.submit(process_audio_job, device_id, segment_id, audio)
         # The complete request has arrived. The device may erase its local WAV
@@ -1119,25 +1125,31 @@ def process_audio():
         return jsonify({"segment_id": segment_id, "state": "processing"}), 202
     except Exception:
         app.logger.exception("Lecture audio processing failed")
-        set_result_failed(device_id, segment_id)
+        set_result_failed(device_id, segment_id, "Could not queue audio processing; see backend log")
         _gemini_slots.release()
         return jsonify({"error": "Lecture processing failed"}), 503
 
 
 def process_audio_job(device_id, segment_id, audio):
+    started = time.monotonic()
     try:
+        app.logger.info("Lecture segment %s: transcription started", segment_id)
         transcript, error = transcribe_wav(audio)
         del audio
         if error:
             app.logger.error("Transcription failed for %s: %s", segment_id, error)
-            set_result_failed(device_id, segment_id)
+            set_result_failed(device_id, segment_id, f"Transcription failed: {error}")
             return
+        app.logger.info("Lecture segment %s: transcription completed in %.1fs", segment_id, time.monotonic() - started)
         transcript = transcript.strip() or "[No intelligible speech detected in this segment.]"
+        notes_started = time.monotonic()
+        app.logger.info("Lecture segment %s: note generation started", segment_id)
         notes_result, error = make_notes(transcript)
         if error:
             app.logger.error("Note generation failed for %s: %s", segment_id, error)
-            set_result_failed(device_id, segment_id)
+            set_result_failed(device_id, segment_id, f"Note generation failed: {error}")
             return
+        app.logger.info("Lecture segment %s: notes completed in %.1fs", segment_id, time.monotonic() - notes_started)
         result = {
             "transcript": transcript,
             "notes": notes_result["notes"],
@@ -1145,9 +1157,10 @@ def process_audio_job(device_id, segment_id, audio):
             "model": f"{GEMINI_AUDIO_MODEL}+{notes_result['model']}",
         }
         save_result(device_id, segment_id, result)
+        app.logger.info("Lecture segment %s: complete in %.1fs", segment_id, time.monotonic() - started)
     except Exception:
         app.logger.exception("Background lecture task failed for %s", segment_id)
-        set_result_failed(device_id, segment_id)
+        set_result_failed(device_id, segment_id, "Background lecture task failed; see backend traceback")
     finally:
         _gemini_slots.release()
 
@@ -1170,7 +1183,7 @@ def get_lecture_result(segment_id):
     if result.get("state") == "processing":
         return jsonify(result), 202
     if result.get("state") == "failed":
-        return jsonify({"error": "Segment processing failed"}), 410
+        return jsonify({"error": "Segment processing failed", "detail": result.get("error", "No failure detail was stored")}), 410
     return jsonify(result)
 
 
