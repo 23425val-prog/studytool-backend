@@ -660,10 +660,13 @@ def little_bat_phrase():
         return jsonify({"error": "ai_busy"}), 503
     try:
         prompt = (
-            "Write exactly one original, upbeat English sentence for a student. "
-            "Use 3 to 7 simple words, no more than 45 characters, and end with "
-            "one punctuation mark. Use plain ASCII. No quotes, emoji, or preamble. "
-            "Do not repeat these recent phrases: "
+            "Write exactly one original, encouraging English sentence for a student. "
+            "Make it feel academic and connected to learning: lectures, notes, "
+            "questions, ideas, curiosity, or steady progress. Keep the tone thoughtful, "
+            "warm, and lightly witty rather than generic cheerleading. Use 3 to 7 "
+            "simple words, no more than 45 characters, and end with one punctuation "
+            "mark. Use plain ASCII. No quotes, emoji, or preamble. Do not repeat "
+            "these recent phrases: "
             f"{json.dumps(avoid, ensure_ascii=True)}. Return only the sentence."
         )
         last_error = None
