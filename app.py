@@ -1337,7 +1337,9 @@ def account_request_code():
         return jsonify({"status": "sent"})
     except Exception:
         app.logger.exception("Could not issue account sign-in code")
-        return jsonify({"error": "Email sign-in is temporarily unavailable"}), 503
+        if not (SMTP_HOST and SMTP_FROM and APP_TOKEN_SECRET):
+            return jsonify({"error": "Email service is not configured. Set SMTP_HOST, SMTP_FROM, and APP_TOKEN_SECRET in Render."}), 503
+        return jsonify({"error": "Email service or database is unavailable. Check the Render logs for the account/request-code error."}), 503
 
 
 @app.post("/account/verify-code")
@@ -1346,6 +1348,7 @@ def account_verify_code():
     address = str(data.get("email", "")).strip().lower()
     code = str(data.get("code", "")).strip()
     username = str(data.get("username", "")).strip().lower()
+    mode = str(data.get("mode", "legacy")).strip().lower()
     if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", address) or not re.fullmatch(r"\d{6}", code):
         return jsonify({"error": "Invalid email or code"}), 400
     if username and not re.fullmatch(r"[a-z0-9_]{3,24}", username):
@@ -1362,6 +1365,10 @@ def account_verify_code():
                 return jsonify({"error": "Incorrect sign-in code"}), 400
             cur.execute("SELECT user_id, username FROM app_users WHERE email = %s", (address,))
             account = cur.fetchone()
+            if mode == "register" and account is not None:
+                return jsonify({"error": "An account already uses this email. Choose Sign in."}), 409
+            if mode == "signin" and account is None:
+                return jsonify({"error": "No account found for this email. Choose Create account."}), 404
             if account is None:
                 if not username:
                     return jsonify({"error": "Choose a username to finish creating your account"}), 400
