@@ -47,6 +47,11 @@ SMTP_USER = os.environ.get("SMTP_USER", "")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
 SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER)
 APP_TOKEN_SECRET = os.environ.get("APP_TOKEN_SECRET", ENROLLMENT_SECRET)
+# Render's free web services block outbound SMTP ports (25/465/587), so sign-in
+# codes can be sent through Brevo's HTTPS API instead. SMTP_FROM must then be a
+# sender address verified in Brevo. SMTP is still used when no API key is set.
+BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "")
+BREVO_SENDER_NAME = os.environ.get("BREVO_SENDER_NAME", "StudyTool")
 RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
 _db_lock = threading.Lock()
 _db_ready = False
@@ -264,9 +269,38 @@ def current_app_user():
         return cur.fetchone()
 
 
+def email_configured():
+    """True when a sign-in code can be sent by either supported transport."""
+    if not (SMTP_FROM and APP_TOKEN_SECRET):
+        return False
+    return bool(BREVO_API_KEY or SMTP_HOST)
+
+
+def send_login_code_brevo(email, code):
+    response = requests.post(
+        "https://api.brevo.com/v3/smtp/email",
+        headers={"api-key": BREVO_API_KEY, "accept": "application/json",
+                 "content-type": "application/json"},
+        json={
+            "sender": {"name": BREVO_SENDER_NAME, "email": SMTP_FROM},
+            "to": [{"email": email}],
+            "subject": "Your StudyTool sign-in code",
+            "textContent": f"Your StudyTool sign-in code is {code}. It expires in 10 minutes.",
+        },
+        timeout=20,
+    )
+    if response.status_code not in (200, 201, 202):
+        app.logger.error("Brevo rejected the sign-in email: HTTP %s %s",
+                         response.status_code, response.text[:300])
+        raise RuntimeError(f"Brevo HTTP {response.status_code}")
+
+
 def send_login_code(email, code):
-    if not (SMTP_HOST and SMTP_FROM and APP_TOKEN_SECRET):
-        raise RuntimeError("Email login requires SMTP_HOST, SMTP_FROM, and APP_TOKEN_SECRET")
+    if not email_configured():
+        raise RuntimeError("Email login requires BREVO_API_KEY or SMTP_HOST, plus SMTP_FROM and APP_TOKEN_SECRET")
+    if BREVO_API_KEY:
+        send_login_code_brevo(email, code)
+        return
     message = EmailMessage()
     message["Subject"] = "Your StudyTool sign-in code"
     message["From"] = SMTP_FROM
@@ -1337,8 +1371,8 @@ def account_request_code():
         return jsonify({"status": "sent"})
     except Exception:
         app.logger.exception("Could not issue account sign-in code")
-        if not (SMTP_HOST and SMTP_FROM and APP_TOKEN_SECRET):
-            return jsonify({"error": "Email service is not configured. Set SMTP_HOST, SMTP_FROM, and APP_TOKEN_SECRET in Render."}), 503
+        if not email_configured():
+            return jsonify({"error": "Email service is not configured. Set BREVO_API_KEY (or SMTP_HOST), SMTP_FROM, and APP_TOKEN_SECRET in Render."}), 503
         return jsonify({"error": "Email service or database is unavailable. Check the Render logs for the account/request-code error."}), 503
 
 
