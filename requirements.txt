@@ -2,3 +2,4 @@ Flask
 gunicorn
 requests
 psycopg2-binary
+reportlab>=4.2,<5
