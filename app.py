@@ -26,6 +26,11 @@ from concurrent.futures import ThreadPoolExecutor
 
 import psycopg2
 import requests
+
+try:  # Fast resampling for narration; a slower pure-Python path is used without it.
+    import numpy as np
+except ImportError:  # pragma: no cover
+    np = None
 from flask import Flask, Response, jsonify, request
 
 app = Flask(__name__)
@@ -41,17 +46,34 @@ GROQ_VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "qwen/qwen3.8-27b")
 GROQ_TTS_MODEL = os.environ.get("GROQ_TTS_MODEL", "canopylabs/orpheus-v1-english")
 GROQ_TTS_VOICE = os.environ.get("GROQ_TTS_VOICE", "autumn")
 MAX_AI_CONCURRENCY = int(os.environ.get("MAX_AI_CONCURRENCY", "4"))
+# Narration (Groq Orpheus TTS). Orpheus accepts fewer than 200 characters per
+# request and has low per-minute / per-day limits on small plans, so narration
+# runs as a background job that paces itself and retries after HTTP 429.
+SPEECH_MAX_CHARS = int(os.environ.get("SPEECH_MAX_CHARS", "24000"))
+SPEECH_CHUNK_CHARS = 190
+SPEECH_MAX_WAIT_SECONDS = int(os.environ.get("SPEECH_MAX_WAIT_SECONDS", "75"))
+SPEECH_TTS_ATTEMPTS = 6
+SPEECH_JOB_TTL_SECONDS = 20 * 60
+SYNC_MAX_AUDIO_BYTES = int(os.environ.get("SYNC_MAX_AUDIO_MB", "40")) * 1024 * 1024
 SMTP_HOST = os.environ.get("SMTP_HOST", "")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER = os.environ.get("SMTP_USER", "")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
 SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER)
 APP_TOKEN_SECRET = os.environ.get("APP_TOKEN_SECRET", ENROLLMENT_SECRET)
+# Render's free web services block outbound SMTP ports (25/465/587), so sign-in
+# codes can be sent through Brevo's HTTPS API instead. SMTP_FROM must then be a
+# sender address verified in Brevo. SMTP is still used when no API key is set.
+BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "")
+BREVO_SENDER_NAME = os.environ.get("BREVO_SENDER_NAME", "StudyTool")
 RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
 _db_lock = threading.Lock()
 _db_ready = False
 _ai_slots = threading.BoundedSemaphore(MAX_AI_CONCURRENCY)
 _audio_jobs = ThreadPoolExecutor(max_workers=MAX_AI_CONCURRENCY)
+_speech_pool = ThreadPoolExecutor(max_workers=2)
+_speech_lock = threading.Lock()
+_speech_jobs = {}
 
 
 _QUESTION_JOB_TTL_SECONDS = 600
@@ -231,6 +253,38 @@ def ensure_db():
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS synced_notes (
+                    note_id BIGSERIAL PRIMARY KEY,
+                    device_id TEXT NOT NULL,
+                    profile_id TEXT NOT NULL,
+                    note_key TEXT NOT NULL,
+                    user_id BIGINT NOT NULL REFERENCES app_users(user_id) ON DELETE CASCADE,
+                    title TEXT NOT NULL,
+                    profile_name TEXT NOT NULL DEFAULT '',
+                    note_crc BIGINT NOT NULL,
+                    note_size BIGINT NOT NULL,
+                    package BYTEA NOT NULL,
+                    cloud_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE(device_id, profile_id, note_key)
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS synced_notes_user_idx ON synced_notes(user_id, updated_at DESC)")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS synced_audio (
+                    device_id TEXT NOT NULL,
+                    profile_id TEXT NOT NULL,
+                    note_key TEXT NOT NULL,
+                    user_id BIGINT NOT NULL REFERENCES app_users(user_id) ON DELETE CASCADE,
+                    wav BYTEA NOT NULL,
+                    wav_size BIGINT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (device_id, profile_id, note_key)
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS synced_audio_user_idx ON synced_audio(user_id)")
         _db_ready = True
 
 
@@ -264,9 +318,38 @@ def current_app_user():
         return cur.fetchone()
 
 
+def email_configured():
+    """True when a sign-in code can be sent by either supported transport."""
+    if not (SMTP_FROM and APP_TOKEN_SECRET):
+        return False
+    return bool(BREVO_API_KEY or SMTP_HOST)
+
+
+def send_login_code_brevo(email, code):
+    response = requests.post(
+        "https://api.brevo.com/v3/smtp/email",
+        headers={"api-key": BREVO_API_KEY, "accept": "application/json",
+                 "content-type": "application/json"},
+        json={
+            "sender": {"name": BREVO_SENDER_NAME, "email": SMTP_FROM},
+            "to": [{"email": email}],
+            "subject": "Your StudyTool sign-in code",
+            "textContent": f"Your StudyTool sign-in code is {code}. It expires in 10 minutes.",
+        },
+        timeout=20,
+    )
+    if response.status_code not in (200, 201, 202):
+        app.logger.error("Brevo rejected the sign-in email: HTTP %s %s",
+                         response.status_code, response.text[:300])
+        raise RuntimeError(f"Brevo HTTP {response.status_code}")
+
+
 def send_login_code(email, code):
-    if not (SMTP_HOST and SMTP_FROM and APP_TOKEN_SECRET):
-        raise RuntimeError("Email login requires SMTP_HOST, SMTP_FROM, and APP_TOKEN_SECRET")
+    if not email_configured():
+        raise RuntimeError("Email login requires BREVO_API_KEY or SMTP_HOST, plus SMTP_FROM and APP_TOKEN_SECRET")
+    if BREVO_API_KEY:
+        send_login_code_brevo(email, code)
+        return
     message = EmailMessage()
     message["Subject"] = "Your StudyTool sign-in code"
     message["From"] = SMTP_FROM
@@ -502,91 +585,301 @@ def describe_lecture_figure(image_bytes, image_mime, context):
                         temperature=0.1, timeout=(5, 120))
 
 
-def split_speech_text(text, max_chars=180):
-    remaining = " ".join(text.split())
+def clean_text_for_speech(text):
+    """Strip Markdown and note markers so the voice does not read '#', '*' or '-'."""
+    text = re.sub(r"<!--.*?-->", " ", text, flags=re.S)
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+    lines = []
+    for line in text.splitlines():
+        line = re.sub(r"^\s{0,3}#{1,6}\s*", "", line)
+        line = re.sub(r"^\s*(?:[-*+\u2022]|\d{1,3}[.)])\s+", "", line)
+        line = line.replace("`", "").replace("**", "").replace("__", "").replace("*", " ")
+        line = " ".join(line.split())
+        if not line or re.fullmatch(r"[-=_|:\s]+", line):
+            continue
+        # A pause (and a chunk boundary) after every heading or bullet.
+        if line[-1] not in ".!?:;":
+            line += "."
+        lines.append(line)
+    return " ".join(lines)
+
+
+def split_speech_text(text, max_chars=SPEECH_CHUNK_CHARS):
+    """Split into chunks below Orpheus' per-request limit, preferably at sentence ends."""
+    sentences = re.split(r"(?<=[.!?;:])\s+", " ".join(text.split()))
     chunks = []
-    while remaining:
-        if len(remaining) <= max_chars:
-            chunks.append(remaining)
-            break
-        cut = remaining.rfind(" ", 0, max_chars + 1)
-        if cut < max_chars // 2:
-            cut = max_chars
-        chunks.append(remaining[:cut].strip())
-        remaining = remaining[cut:].strip()
+    current = ""
+    for sentence in sentences:
+        while len(sentence) > max_chars:
+            cut = sentence.rfind(" ", 0, max_chars + 1)
+            if cut < max_chars // 2:
+                cut = max_chars
+            head, sentence = sentence[:cut].strip(), sentence[cut:].strip()
+            if current:
+                chunks.append(current)
+                current = ""
+            if head:
+                chunks.append(head)
+        if not sentence:
+            continue
+        if current and len(current) + 1 + len(sentence) <= max_chars:
+            current += " " + sentence
+        else:
+            if current:
+                chunks.append(current)
+            current = sentence
+    if current:
+        chunks.append(current)
     return chunks
 
 
-def resample_speech_pcm_for_bm83(pcm):
-    """Convert 24 kHz mono little-endian PCM to 44.1 kHz stereo little-endian PCM."""
-    import array
-    import math
-    import sys
-
-    samples = array.array("h")
-    samples.frombytes(pcm)
-    if sys.byteorder != "little":
-        samples.byteswap()
-    if not samples:
-        return b""
-
-    source_rate = 24000
-    target_rate = 44100
-    frame_count = (len(samples) * target_rate + source_rate - 1) // source_rate
-    output = array.array("h", [0]) * (frame_count * 2)
-    for frame in range(frame_count):
-        position_num = frame * source_rate
-        index, fraction = divmod(position_num, target_rate)
-        first = samples[min(index, len(samples) - 1)]
-        second = samples[min(index + 1, len(samples) - 1)]
-        value = first + ((second - first) * fraction // target_rate)
-        value = max(-32768, min(32767, value))
-        output[frame * 2] = value
-        output[frame * 2 + 1] = value
-    if sys.byteorder != "little":
-        output.byteswap()
-    return output.tobytes()
+def _parse_duration_seconds(raw):
+    match = re.fullmatch(r"(?:(\d+(?:\.\d+)?)h)?(?:(\d+(?:\.\d+)?)m(?![a-z]))?(?:(\d+(?:\.\d+)?)s)?", (raw or "").strip())
+    if not match or not any(match.groups()):
+        return None
+    hours, minutes, seconds = (float(g) if g else 0.0 for g in match.groups())
+    return hours * 3600 + minutes * 60 + seconds
 
 
-def make_speech_pcm(text):
-    """Generate speech, then resample to 44.1 kHz stereo for the BM83 A2DP source."""
-    chunks = split_speech_text(text)
-    if not chunks:
-        return None, {"status": 400, "message": "No text to speak"}
-    pcm = bytearray()
-    for chunk in chunks:
-        payload = {
-            "model": GROQ_TTS_MODEL,
-            "input": chunk,
-            "voice": GROQ_TTS_VOICE,
-            "response_format": "wav",
-            "sample_rate": 24000,
-        }
+def _retry_after_seconds(response):
+    value = response.headers.get("retry-after")
+    if value:
+        try:
+            return max(0.0, float(value))
+        except ValueError:
+            pass
+    waits = [_parse_duration_seconds(response.headers.get(name))
+             for name in ("x-ratelimit-reset-requests", "x-ratelimit-reset-tokens")]
+    waits = [w for w in waits if w is not None]
+    return max(waits) if waits else 10.0
+
+
+def _speech_error(status, detail, code=None):
+    text = detail if isinstance(detail, str) else json.dumps(detail, ensure_ascii=False)
+    low = text.lower()
+    if code is None:
+        if "terms" in low and status in (400, 403):
+            code = "terms_required"
+        elif status in (401, 403):
+            code = "auth"
+        elif status == 429:
+            code = "rate_limited"
+        elif status in (408, 504):
+            code = "timeout"
+        else:
+            code = "tts_failed"
+    return {"status": status, "code": code, "message": text[:300]}
+
+
+def _speech_sleep(seconds, job=None):
+    """Sleep in 1 s steps; returns False when the job was cancelled meanwhile."""
+    end = time.time() + seconds
+    while True:
+        if job is not None and job.get("cancel"):
+            return False
+        remaining = end - time.time()
+        if remaining <= 0:
+            return True
+        time.sleep(min(1.0, remaining))
+
+
+def tts_chunk_pcm(chunk, job=None):
+    """One Orpheus request (< 200 chars) -> (24 kHz mono 16-bit PCM, None) or (None, error).
+
+    HTTP 429 is retried after the delay Groq asks for. A delay longer than
+    SPEECH_MAX_WAIT_SECONDS means a daily quota is used up, which is reported
+    as 'daily_limit' instead of making the device wait for hours.
+    """
+    payload = {
+        "model": GROQ_TTS_MODEL,
+        "input": chunk,
+        "voice": GROQ_TTS_VOICE,
+        "response_format": "wav",
+        "sample_rate": 24000,
+    }
+    last = _speech_error(503, "no attempt made", "network")
+    for attempt in range(SPEECH_TTS_ATTEMPTS):
+        if job is not None and job.get("cancel"):
+            return None, _speech_error(499, "cancelled", "cancelled")
         try:
             response = requests.post(
                 "https://api.groq.com/openai/v1/audio/speech", json=payload,
                 headers={"Content-Type": "application/json", "Authorization": f"Bearer {GROQ_API_KEY}"},
-                timeout=(5, 90),
+                timeout=(5, 60),
             )
+        except requests.Timeout as exc:
+            last = _speech_error(504, str(exc), "timeout")
+            if not _speech_sleep(2 * (attempt + 1), job):
+                return None, _speech_error(499, "cancelled", "cancelled")
+            continue
         except requests.RequestException as exc:
-            return None, {"status": 503, "message": str(exc)}
-        if not response.ok:
+            last = _speech_error(503, str(exc), "network")
+            if not _speech_sleep(2 * (attempt + 1), job):
+                return None, _speech_error(499, "cancelled", "cancelled")
+            continue
+        if response.ok:
             try:
-                detail = response.json()
-            except ValueError:
-                detail = response.text[:1000]
-            return None, {"status": response.status_code, "message": detail}
+                with wave.open(io.BytesIO(response.content), "rb") as wav:
+                    if wav.getnchannels() != 1 or wav.getsampwidth() != 2 or wav.getframerate() != 24000:
+                        raise ValueError("expected 24 kHz, 16-bit mono WAV from Groq TTS")
+                    audio = wav.readframes(wav.getnframes())
+                if not audio or len(audio) % 2:
+                    raise ValueError("Groq returned empty or invalid 16-bit PCM data")
+                return audio, None
+            except (wave.Error, EOFError, ValueError) as exc:
+                return None, _speech_error(502, f"Groq returned invalid speech audio: {exc}", "tts_failed")
         try:
-            with wave.open(io.BytesIO(response.content), "rb") as wav:
-                if wav.getnchannels() != 1 or wav.getsampwidth() != 2 or wav.getframerate() != 24000:
-                    raise ValueError("expected 24 kHz, 16-bit mono WAV from Groq TTS")
-                audio = wav.readframes(wav.getnframes())
-            if not audio or len(audio) % 2:
-                raise ValueError("Groq returned empty or invalid 16-bit PCM data")
-            pcm.extend(audio)
-        except (wave.Error, EOFError, ValueError) as exc:
-            return None, {"status": 502, "message": f"Groq returned invalid speech audio: {exc}"}
-    return resample_speech_pcm_for_bm83(bytes(pcm)), None
+            detail = response.json()
+        except ValueError:
+            detail = response.text[:1000]
+        last = _speech_error(response.status_code, detail)
+        if response.status_code == 429:
+            wait = _retry_after_seconds(response)
+            if wait > SPEECH_MAX_WAIT_SECONDS:
+                last["code"] = "daily_limit"
+                return None, last
+            if not _speech_sleep(wait + 1, job):
+                return None, _speech_error(499, "cancelled", "cancelled")
+            continue
+        if response.status_code in (500, 502, 503, 504):
+            if not _speech_sleep(2 * (attempt + 1), job):
+                return None, _speech_error(499, "cancelled", "cancelled")
+            continue
+        return None, last
+    return None, last
+
+
+# --- 24 kHz mono -> 44.1 kHz stereo (BM83 / I2S) ------------------------------
+# 44100 / 24000 = 147 / 80, so every 80 source samples give exactly 147 frames.
+# Blocks of 600 * 80 source samples therefore resample independently and
+# produce exactly the same output as one pass over the whole signal.
+_SPEECH_BLOCK_FRAMES = 147 * 600
+
+
+def speech_stereo_frames(mono_bytes):
+    return (mono_bytes // 2 * 147 + 79) // 80
+
+
+def speech_stereo_size(mono_bytes):
+    return speech_stereo_frames(mono_bytes) * 4
+
+
+def iter_speech_stereo(mono_pcm):
+    """Yield 44.1 kHz stereo little-endian PCM for 24 kHz mono little-endian PCM."""
+    import array
+    import sys
+
+    count = len(mono_pcm) // 2
+    if count == 0:
+        return
+    total = speech_stereo_frames(len(mono_pcm))
+    if np is not None:
+        samples = np.frombuffer(mono_pcm, dtype="<i2", count=count)
+    else:
+        samples = array.array("h")
+        samples.frombytes(bytes(mono_pcm[:count * 2]))
+        if sys.byteorder != "little":
+            samples.byteswap()
+    for start in range(0, total, _SPEECH_BLOCK_FRAMES):
+        stop = min(start + _SPEECH_BLOCK_FRAMES, total)
+        if np is not None:
+            frames = np.arange(start, stop, dtype=np.int64)
+            position = frames * 80
+            index = position // 147
+            fraction = position % 147
+            first = samples[np.minimum(index, count - 1)].astype(np.int64)
+            second = samples[np.minimum(index + 1, count - 1)].astype(np.int64)
+            value = np.clip(first + ((second - first) * fraction) // 147, -32768, 32767).astype("<i2")
+            stereo = np.empty(value.size * 2, dtype="<i2")
+            stereo[0::2] = value
+            stereo[1::2] = value
+            yield stereo.tobytes()
+        else:
+            out = array.array("h", [0]) * ((stop - start) * 2)
+            for k, frame in enumerate(range(start, stop)):
+                index, fraction = divmod(frame * 80, 147)
+                first = samples[min(index, count - 1)]
+                second = samples[min(index + 1, count - 1)]
+                value = max(-32768, min(32767, first + ((second - first) * fraction) // 147))
+                out[2 * k] = value
+                out[2 * k + 1] = value
+            if sys.byteorder != "little":
+                out.byteswap()
+            yield out.tobytes()
+
+
+def resample_speech_pcm_for_bm83(pcm):
+    """Whole-buffer convenience wrapper around iter_speech_stereo()."""
+    return b"".join(iter_speech_stereo(pcm))
+
+
+def wav_from_mono_pcm(pcm, rate=24000):
+    import struct
+    size = len(pcm)
+    header = (b"RIFF" + struct.pack("<I", 36 + size) + b"WAVEfmt " +
+              struct.pack("<IHHIIHH", 16, 1, 1, rate, rate * 2, 2, 16) +
+              b"data" + struct.pack("<I", size))
+    return header + bytes(pcm)
+
+
+def make_speech_mono(text):
+    """Synchronous narration (used by the legacy /notes/speech endpoint)."""
+    chunks = split_speech_text(clean_text_for_speech(text))
+    if not chunks:
+        return None, _speech_error(400, "No text to speak", "no_text")
+    pcm = bytearray()
+    for chunk in chunks:
+        audio, error = tts_chunk_pcm(chunk)
+        if error:
+            return None, error
+        pcm.extend(audio)
+    return pcm, None
+
+
+def store_cloud_narration(job):
+    """Keep a copy of a finished narration for the linked account (phone app download).
+
+    Returns a short status string; failures never affect the device download.
+    """
+    profile_id, note_key = job.get("profile_id", ""), job.get("note_key", "")
+    if not profile_id or not note_key:
+        return "skipped"
+    wav = wav_from_mono_pcm(job["pcm"])
+    if len(wav) > SYNC_MAX_AUDIO_BYTES:
+        return "too_large"
+    try:
+        with db_connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT user_id FROM device_profile_links WHERE device_id = %s AND profile_id = %s",
+                        (job["device_id"], profile_id))
+            row = cur.fetchone()
+            if not row:
+                return "not_linked"
+            owner = row[0]
+            cur.execute("SELECT cloud_deleted FROM synced_notes WHERE device_id = %s AND profile_id = %s AND note_key = %s",
+                        (job["device_id"], profile_id, note_key))
+            existing = cur.fetchone()
+            if existing and existing[0]:
+                return "removed"  # the person removed this note from the cloud
+            cur.execute("""
+                SELECT COALESCE((SELECT SUM(octet_length(package)) FROM synced_notes WHERE user_id = %s), 0)
+                     + COALESCE((SELECT SUM(wav_size) FROM synced_audio WHERE user_id = %s
+                                 AND NOT (device_id = %s AND profile_id = %s AND note_key = %s)), 0)
+            """, (owner, owner, job["device_id"], profile_id, note_key))
+            used = int(cur.fetchone()[0])
+            if used + len(wav) > SYNC_MAX_USER_BYTES:
+                return "full"
+            cur.execute("""
+                INSERT INTO synced_audio(device_id, profile_id, note_key, user_id, wav, wav_size)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT(device_id, profile_id, note_key) DO UPDATE SET
+                    user_id = EXCLUDED.user_id, wav = EXCLUDED.wav,
+                    wav_size = EXCLUDED.wav_size, created_at = NOW()
+            """, (job["device_id"], profile_id, note_key, owner, psycopg2.Binary(wav), len(wav)))
+        return "synced"
+    except Exception:
+        app.logger.exception("Could not store narration copy for the cloud")
+        return "error"
 
 
 def make_notes(transcript):
@@ -1084,30 +1377,175 @@ def acknowledge_note_qna(session_id):
         return jsonify({"error": "qna_storage_unavailable"}), 503
 
 
-@app.post("/notes/speech")
-def speak_note():
+def _speech_device():
     device_id = request.headers.get("x-device-id", "")
     token = request.headers.get("x-device-token", "")
     try:
         if not authorized(device_id, token):
-            return jsonify({"error": "Invalid device credentials"}), 401
+            return None, (jsonify({"error": "Invalid device credentials", "code": "device_auth"}), 401)
     except Exception:
         app.logger.exception("Speech authorization failed")
-        return jsonify({"error": "Authorization unavailable"}), 503
+        return None, (jsonify({"error": "Authorization unavailable", "code": "server_error"}), 503)
+    return device_id, None
+
+
+def _prune_speech_jobs():
+    """Caller holds _speech_lock. Drops finished jobs after their TTL and stale running ones."""
+    now = time.time()
+    for job_id, job in list(_speech_jobs.items()):
+        finished_old = job["state"] != "running" and now - job["touched"] > SPEECH_JOB_TTL_SECONDS
+        stuck = now - job["created"] > 3 * 3600
+        if finished_old or stuck:
+            job["cancel"] = True
+            del _speech_jobs[job_id]
+
+
+def _speech_job_for(device_id, job_id):
+    with _speech_lock:
+        job = _speech_jobs.get(job_id)
+    return job if job is not None and job["device_id"] == device_id else None
+
+
+def _run_speech_job(job_id, chunks):
+    job = _speech_jobs.get(job_id)
+    if job is None:
+        return
+    try:
+        for index, chunk in enumerate(chunks):
+            if job["cancel"]:
+                job["state"] = "cancelled"
+                return
+            pcm, error = tts_chunk_pcm(chunk, job)
+            if error:
+                if job["cancel"]:
+                    job["state"] = "cancelled"
+                    return
+                app.logger.warning("Narration job %s failed at part %d/%d: %s",
+                                   job_id, index + 1, len(chunks), error)
+                job.update(state="failed", error=error["code"], message=error["message"],
+                           upstream_status=error["status"])
+                return
+            job["pcm"].extend(pcm)
+            job["done"] = index + 1
+            job["touched"] = time.time()
+        job["audio_bytes"] = speech_stereo_size(len(job["pcm"]))
+        job["cloud"] = store_cloud_narration(job)
+        job["state"] = "done"
+    except Exception:
+        app.logger.exception("Narration job %s crashed", job_id)
+        job.update(state="failed", error="server_error", message="Narration job crashed")
+    finally:
+        job["touched"] = time.time()
+        if job["state"] != "done":
+            job["pcm"] = bytearray()  # free memory of unfinished jobs
+
+
+@app.post("/notes/speech/start")
+def start_note_speech():
+    device_id, failure = _speech_device()
+    if failure:
+        return failure
     data = request.get_json(silent=True)
     text = data.get("text", "") if isinstance(data, dict) else ""
-    if not isinstance(text, str) or not text.strip() or len(text) > 24000:
-        return jsonify({"error": "Text must contain 1 to 24000 characters"}), 400
+    if not isinstance(text, str) or not text.strip() or len(text) > SPEECH_MAX_CHARS:
+        return jsonify({"error": f"Text must contain 1 to {SPEECH_MAX_CHARS} characters", "code": "bad_text"}), 400
+    if not GROQ_API_KEY:
+        return jsonify({"error": "groq_api_key_missing", "code": "groq_key_missing"}), 503
+    cleaned = clean_text_for_speech(text)
+    chunks = split_speech_text(cleaned)
+    if not chunks:
+        return jsonify({"error": "No speakable text", "code": "no_text"}), 400
+    profile_id = request.headers.get("x-profile-id", "")
+    note_key = request.headers.get("x-note-key", "")
+    if not re.fullmatch(r"[a-z0-9_-]{1,24}", profile_id):
+        profile_id = ""
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,120}", note_key) or ".." in note_key:
+        note_key = ""
+    now = time.time()
+    job_id = secrets.token_urlsafe(12)
+    job = {"id": job_id, "device_id": device_id, "profile_id": profile_id, "note_key": note_key,
+           "state": "running", "done": 0, "total": len(chunks), "error": "", "message": "",
+           "upstream_status": 0, "pcm": bytearray(), "audio_bytes": 0, "cloud": "",
+           "cancel": False, "created": now, "touched": now}
+    with _speech_lock:
+        _prune_speech_jobs()
+        for old_id, old in list(_speech_jobs.items()):
+            if old["device_id"] == device_id:  # one narration per device at a time
+                old["cancel"] = True
+                del _speech_jobs[old_id]
+        _speech_jobs[job_id] = job
+    _speech_pool.submit(_run_speech_job, job_id, chunks)
+    return jsonify({"job_id": job_id, "chunks": len(chunks), "chars": len(cleaned)}), 202
+
+
+@app.get("/notes/speech/<job_id>")
+def note_speech_status(job_id):
+    device_id, failure = _speech_device()
+    if failure:
+        return failure
+    job = _speech_job_for(device_id, job_id)
+    if job is None:
+        return jsonify({"error": "Narration job not found", "code": "job_lost"}), 404
+    job["touched"] = time.time()
+    return jsonify({"state": job["state"], "done": job["done"], "total": job["total"],
+                    "code": job["error"], "message": job["message"],
+                    "audio_bytes": job["audio_bytes"], "cloud": job["cloud"]})
+
+
+@app.get("/notes/speech/<job_id>/audio")
+def note_speech_audio(job_id):
+    device_id, failure = _speech_device()
+    if failure:
+        return failure
+    job = _speech_job_for(device_id, job_id)
+    if job is None:
+        return jsonify({"error": "Narration job not found", "code": "job_lost"}), 404
+    if job["state"] != "done":
+        return jsonify({"error": "Narration is not ready", "code": "not_ready"}), 409
+    job["touched"] = time.time()
+    response = Response(iter_speech_stereo(job["pcm"]), mimetype="audio/L16")
+    response.headers["Content-Length"] = str(job["audio_bytes"])
+    response.headers["X-Sample-Rate"] = "44100"
+    response.headers["X-Audio-Channels"] = "2"
+    return response
+
+
+@app.delete("/notes/speech/<job_id>")
+def delete_note_speech(job_id):
+    device_id, failure = _speech_device()
+    if failure:
+        return failure
+    with _speech_lock:
+        job = _speech_jobs.get(job_id)
+        if job is not None and job["device_id"] == device_id:
+            job["cancel"] = True
+            del _speech_jobs[job_id]
+    return "", 204
+
+
+@app.post("/notes/speech")
+def speak_note():
+    """Legacy one-request narration. Prefer /notes/speech/start for anything long."""
+    device_id, failure = _speech_device()
+    if failure:
+        return failure
+    data = request.get_json(silent=True)
+    text = data.get("text", "") if isinstance(data, dict) else ""
+    if not isinstance(text, str) or not text.strip() or len(text) > SPEECH_MAX_CHARS:
+        return jsonify({"error": f"Text must contain 1 to {SPEECH_MAX_CHARS} characters"}), 400
     if not GROQ_API_KEY:
         return jsonify({"error": "groq_api_key_missing"}), 503
     if not _ai_slots.acquire(blocking=False):
         return jsonify({"error": "ai_busy"}), 429
     try:
-        audio, error = make_speech_pcm(text.strip())
+        mono, error = make_speech_mono(text.strip())
         if error:
             app.logger.warning("Note speech generation failed: %s", error)
-            return jsonify({"error": "speech_generation_failed", "detail": str(error)[:300]}), 502
-        response = Response(audio, mimetype="audio/L16")
+            status = 429 if error["code"] in ("rate_limited", "daily_limit") else 502
+            return jsonify({"error": "speech_generation_failed", "code": error["code"],
+                            "detail": error["message"]}), status
+        response = Response(iter_speech_stereo(mono), mimetype="audio/L16")
+        response.headers["Content-Length"] = str(speech_stereo_size(len(mono)))
         response.headers["X-Sample-Rate"] = "44100"
         response.headers["X-Audio-Channels"] = "2"
         return response
@@ -1337,8 +1775,8 @@ def account_request_code():
         return jsonify({"status": "sent"})
     except Exception:
         app.logger.exception("Could not issue account sign-in code")
-        if not (SMTP_HOST and SMTP_FROM and APP_TOKEN_SECRET):
-            return jsonify({"error": "Email service is not configured. Set SMTP_HOST, SMTP_FROM, and APP_TOKEN_SECRET in Render."}), 503
+        if not email_configured():
+            return jsonify({"error": "Email service is not configured. Set BREVO_API_KEY (or SMTP_HOST), SMTP_FROM, and APP_TOKEN_SECRET in Render."}), 503
         return jsonify({"error": "Email service or database is unavailable. Check the Render logs for the account/request-code error."}), 503
 
 
@@ -1781,6 +2219,195 @@ def download_shared_note(note_id):
     response = Response(bytes(row[1]), mimetype="application/zip")
     response.headers["Content-Disposition"] = f'attachment; filename="{row[0]}"'
     return response
+
+
+# ---------------------------------------------------------------------------
+# Note sync between a linked StudyTool profile and the phone app.
+#
+# The device is the source of truth: it uploads each saved note (Markdown plus
+# linked photos, no narration WAV) as a ZIP. Deleting a note on the device never
+# deletes the cloud copy. The phone can hide a cloud copy; that leaves a small
+# marker so the device does not upload the same unchanged note again.
+# ---------------------------------------------------------------------------
+SYNC_MAX_PACKAGE_BYTES = 9 * 1024 * 1024
+SYNC_MAX_USER_BYTES = int(os.environ.get("SYNC_MAX_USER_MB", "300")) * 1024 * 1024
+
+
+def _decode_header_text(value, limit):
+    from urllib.parse import unquote
+    try:
+        text = unquote(value or "", errors="ignore")
+    except Exception:
+        text = value or ""
+    return " ".join(text.split())[:limit]
+
+
+@app.get("/device/sync/notes")
+def device_sync_list():
+    owner, err = device_profile_owner()
+    if err:
+        return err
+    device_id = request.headers.get("x-device-id", "")
+    profile_id = request.headers.get("x-profile-id", "")
+    try:
+        with db_connect() as conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT note_key, note_crc, note_size FROM synced_notes
+                WHERE device_id = %s AND profile_id = %s AND user_id = %s
+            """, (device_id, profile_id, owner))
+            rows = cur.fetchall()
+        return jsonify({"notes": [{"key": r[0], "crc": int(r[1]), "size": int(r[2])} for r in rows]})
+    except Exception:
+        app.logger.exception("Could not list synced notes")
+        return jsonify({"error": "Sync unavailable"}), 503
+
+
+@app.post("/device/sync/notes")
+def device_sync_upload():
+    owner, err = device_profile_owner()
+    if err:
+        return err
+    device_id = request.headers.get("x-device-id", "")
+    profile_id = request.headers.get("x-profile-id", "")
+    note_key = request.headers.get("x-note-key", "")
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,120}", note_key) or ".." in note_key:
+        return jsonify({"error": "Invalid note key"}), 400
+    try:
+        note_crc = int(request.headers.get("x-note-crc", ""))
+        note_size = int(request.headers.get("x-note-size", ""))
+    except ValueError:
+        return jsonify({"error": "Invalid note fingerprint"}), 400
+    if not (0 <= note_crc <= 0xFFFFFFFF) or note_size < 0:
+        return jsonify({"error": "Invalid note fingerprint"}), 400
+    title = _decode_header_text(request.headers.get("x-note-title", ""), 120) or note_key
+    profile_name = _decode_header_text(request.headers.get("x-profile-name", ""), 40)
+    package = request.get_data(cache=False)
+    if not package.startswith(b"PK\x03\x04"):
+        return jsonify({"error": "Expected a ZIP note package"}), 415
+    if len(package) > SYNC_MAX_PACKAGE_BYTES:
+        return jsonify({"error": "Note package exceeds 9 MB"}), 413
+    try:
+        with db_connect() as conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT COALESCE(SUM(octet_length(package)), 0) FROM synced_notes
+                WHERE user_id = %s AND NOT (device_id = %s AND profile_id = %s AND note_key = %s)
+            """, (owner, device_id, profile_id, note_key))
+            used = int(cur.fetchone()[0])
+            if used + len(package) > SYNC_MAX_USER_BYTES:
+                return jsonify({"error": "Cloud storage is full"}), 507
+            cur.execute("""
+                INSERT INTO synced_notes(device_id, profile_id, note_key, user_id, title,
+                                         profile_name, note_crc, note_size, package)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT(device_id, profile_id, note_key) DO UPDATE SET
+                    user_id = EXCLUDED.user_id, title = EXCLUDED.title,
+                    profile_name = EXCLUDED.profile_name, note_crc = EXCLUDED.note_crc,
+                    note_size = EXCLUDED.note_size, package = EXCLUDED.package,
+                    cloud_deleted = FALSE, updated_at = NOW()
+                RETURNING note_id
+            """, (device_id, profile_id, note_key, owner, title, profile_name,
+                  note_crc, note_size, psycopg2.Binary(package)))
+            note_id = cur.fetchone()[0]
+        return jsonify({"id": note_id, "status": "synced"}), 201
+    except Exception:
+        app.logger.exception("Could not store synced note")
+        return jsonify({"error": "Sync unavailable"}), 503
+
+
+@app.get("/account/notes")
+def account_notes_list():
+    user, failure = friend_error()
+    if failure:
+        return failure
+    try:
+        with db_connect() as conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT n.note_id, n.title, n.profile_name, n.profile_id, n.note_key,
+                       octet_length(n.package), n.updated_at, COALESCE(a.wav_size, 0)
+                FROM synced_notes n
+                LEFT JOIN synced_audio a
+                  ON a.device_id = n.device_id AND a.profile_id = n.profile_id
+                 AND a.note_key = n.note_key AND a.user_id = n.user_id
+                WHERE n.user_id = %s AND NOT n.cloud_deleted
+                ORDER BY n.updated_at DESC
+            """, (user[0],))
+            rows = cur.fetchall()
+        return jsonify({"notes": [{
+            "id": r[0], "title": r[1], "profile": r[2] or r[3], "filename": r[4],
+            "size": int(r[5]), "updated_at": r[6].isoformat(),
+            "audio_size": int(r[7])} for r in rows]})
+    except Exception:
+        app.logger.exception("Could not list cloud notes")
+        return jsonify({"error": "Cloud notes unavailable"}), 503
+
+
+@app.get("/account/notes/<int:note_id>")
+def account_note_download(note_id):
+    user, failure = friend_error()
+    if failure:
+        return failure
+    with db_connect() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT note_key, package FROM synced_notes
+            WHERE note_id = %s AND user_id = %s AND NOT cloud_deleted
+        """, (note_id, user[0]))
+        row = cur.fetchone()
+    if not row:
+        return jsonify({"error": "Cloud note not found"}), 404
+    name = re.sub(r"\.md$", "", row[0], flags=re.I) + ".zip"
+    response = Response(bytes(row[1]), mimetype="application/zip")
+    response.headers["Content-Disposition"] = f'attachment; filename="{name}"'
+    return response
+
+
+@app.get("/account/notes/<int:note_id>/audio")
+def account_note_audio_download(note_id):
+    user, failure = friend_error()
+    if failure:
+        return failure
+    with db_connect() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT n.note_key, a.wav FROM synced_notes n
+            JOIN synced_audio a
+              ON a.device_id = n.device_id AND a.profile_id = n.profile_id
+             AND a.note_key = n.note_key AND a.user_id = n.user_id
+            WHERE n.note_id = %s AND n.user_id = %s AND NOT n.cloud_deleted
+        """, (note_id, user[0]))
+        row = cur.fetchone()
+    if not row:
+        return jsonify({"error": "No narration audio for this note"}), 404
+    name = re.sub(r"\.md$", "", row[0], flags=re.I) + ".wav"
+    wav = bytes(row[1])
+    response = Response(wav, mimetype="audio/wav")
+    response.headers["Content-Length"] = str(len(wav))
+    response.headers["Content-Disposition"] = f'attachment; filename="{name}"'
+    return response
+
+
+@app.delete("/account/notes/<int:note_id>")
+def account_note_delete(note_id):
+    user, failure = friend_error()
+    if failure:
+        return failure
+    with db_connect() as conn, conn.cursor() as cur:
+        # Keep a marker row (same fingerprint, empty package) so the device does
+        # not immediately upload the unchanged note again.
+        cur.execute("""
+            UPDATE synced_notes SET cloud_deleted = TRUE, package = ''::bytea, updated_at = NOW()
+            WHERE note_id = %s AND user_id = %s AND NOT cloud_deleted
+        """, (note_id, user[0]))
+        deleted = cur.rowcount
+        if deleted:
+            # The narration belongs to the cloud copy of the note.
+            cur.execute("""
+                DELETE FROM synced_audio a USING synced_notes n
+                WHERE n.note_id = %s AND n.user_id = %s
+                  AND a.device_id = n.device_id AND a.profile_id = n.profile_id
+                  AND a.note_key = n.note_key
+            """, (note_id, user[0]))
+    if not deleted:
+        return jsonify({"error": "Cloud note not found"}), 404
+    return jsonify({"status": "removed from cloud"})
 
 
 if __name__ == "__main__":
