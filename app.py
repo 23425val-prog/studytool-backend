@@ -236,6 +236,25 @@ def ensure_db():
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS synced_notes (
+                    note_id BIGSERIAL PRIMARY KEY,
+                    device_id TEXT NOT NULL,
+                    profile_id TEXT NOT NULL,
+                    note_key TEXT NOT NULL,
+                    user_id BIGINT NOT NULL REFERENCES app_users(user_id) ON DELETE CASCADE,
+                    title TEXT NOT NULL,
+                    profile_name TEXT NOT NULL DEFAULT '',
+                    note_crc BIGINT NOT NULL,
+                    note_size BIGINT NOT NULL,
+                    package BYTEA NOT NULL,
+                    cloud_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE(device_id, profile_id, note_key)
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS synced_notes_user_idx ON synced_notes(user_id, updated_at DESC)")
         _db_ready = True
 
 
@@ -1815,6 +1834,159 @@ def download_shared_note(note_id):
     response = Response(bytes(row[1]), mimetype="application/zip")
     response.headers["Content-Disposition"] = f'attachment; filename="{row[0]}"'
     return response
+
+
+# ---------------------------------------------------------------------------
+# Note sync between a linked StudyTool profile and the phone app.
+#
+# The device is the source of truth: it uploads each saved note (Markdown plus
+# linked photos, no narration WAV) as a ZIP. Deleting a note on the device never
+# deletes the cloud copy. The phone can hide a cloud copy; that leaves a small
+# marker so the device does not upload the same unchanged note again.
+# ---------------------------------------------------------------------------
+SYNC_MAX_PACKAGE_BYTES = 9 * 1024 * 1024
+SYNC_MAX_USER_BYTES = int(os.environ.get("SYNC_MAX_USER_MB", "300")) * 1024 * 1024
+
+
+def _decode_header_text(value, limit):
+    from urllib.parse import unquote
+    try:
+        text = unquote(value or "", errors="ignore")
+    except Exception:
+        text = value or ""
+    return " ".join(text.split())[:limit]
+
+
+@app.get("/device/sync/notes")
+def device_sync_list():
+    owner, err = device_profile_owner()
+    if err:
+        return err
+    device_id = request.headers.get("x-device-id", "")
+    profile_id = request.headers.get("x-profile-id", "")
+    try:
+        with db_connect() as conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT note_key, note_crc, note_size FROM synced_notes
+                WHERE device_id = %s AND profile_id = %s AND user_id = %s
+            """, (device_id, profile_id, owner))
+            rows = cur.fetchall()
+        return jsonify({"notes": [{"key": r[0], "crc": int(r[1]), "size": int(r[2])} for r in rows]})
+    except Exception:
+        app.logger.exception("Could not list synced notes")
+        return jsonify({"error": "Sync unavailable"}), 503
+
+
+@app.post("/device/sync/notes")
+def device_sync_upload():
+    owner, err = device_profile_owner()
+    if err:
+        return err
+    device_id = request.headers.get("x-device-id", "")
+    profile_id = request.headers.get("x-profile-id", "")
+    note_key = request.headers.get("x-note-key", "")
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,120}", note_key) or ".." in note_key:
+        return jsonify({"error": "Invalid note key"}), 400
+    try:
+        note_crc = int(request.headers.get("x-note-crc", ""))
+        note_size = int(request.headers.get("x-note-size", ""))
+    except ValueError:
+        return jsonify({"error": "Invalid note fingerprint"}), 400
+    if not (0 <= note_crc <= 0xFFFFFFFF) or note_size < 0:
+        return jsonify({"error": "Invalid note fingerprint"}), 400
+    title = _decode_header_text(request.headers.get("x-note-title", ""), 120) or note_key
+    profile_name = _decode_header_text(request.headers.get("x-profile-name", ""), 40)
+    package = request.get_data(cache=False)
+    if not package.startswith(b"PK\x03\x04"):
+        return jsonify({"error": "Expected a ZIP note package"}), 415
+    if len(package) > SYNC_MAX_PACKAGE_BYTES:
+        return jsonify({"error": "Note package exceeds 9 MB"}), 413
+    try:
+        with db_connect() as conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT COALESCE(SUM(octet_length(package)), 0) FROM synced_notes
+                WHERE user_id = %s AND NOT (device_id = %s AND profile_id = %s AND note_key = %s)
+            """, (owner, device_id, profile_id, note_key))
+            used = int(cur.fetchone()[0])
+            if used + len(package) > SYNC_MAX_USER_BYTES:
+                return jsonify({"error": "Cloud storage is full"}), 507
+            cur.execute("""
+                INSERT INTO synced_notes(device_id, profile_id, note_key, user_id, title,
+                                         profile_name, note_crc, note_size, package)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT(device_id, profile_id, note_key) DO UPDATE SET
+                    user_id = EXCLUDED.user_id, title = EXCLUDED.title,
+                    profile_name = EXCLUDED.profile_name, note_crc = EXCLUDED.note_crc,
+                    note_size = EXCLUDED.note_size, package = EXCLUDED.package,
+                    cloud_deleted = FALSE, updated_at = NOW()
+                RETURNING note_id
+            """, (device_id, profile_id, note_key, owner, title, profile_name,
+                  note_crc, note_size, psycopg2.Binary(package)))
+            note_id = cur.fetchone()[0]
+        return jsonify({"id": note_id, "status": "synced"}), 201
+    except Exception:
+        app.logger.exception("Could not store synced note")
+        return jsonify({"error": "Sync unavailable"}), 503
+
+
+@app.get("/account/notes")
+def account_notes_list():
+    user, failure = friend_error()
+    if failure:
+        return failure
+    try:
+        with db_connect() as conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT note_id, title, profile_name, profile_id, note_key,
+                       octet_length(package), updated_at
+                FROM synced_notes
+                WHERE user_id = %s AND NOT cloud_deleted
+                ORDER BY updated_at DESC
+            """, (user[0],))
+            rows = cur.fetchall()
+        return jsonify({"notes": [{
+            "id": r[0], "title": r[1], "profile": r[2] or r[3], "filename": r[4],
+            "size": int(r[5]), "updated_at": r[6].isoformat()} for r in rows]})
+    except Exception:
+        app.logger.exception("Could not list cloud notes")
+        return jsonify({"error": "Cloud notes unavailable"}), 503
+
+
+@app.get("/account/notes/<int:note_id>")
+def account_note_download(note_id):
+    user, failure = friend_error()
+    if failure:
+        return failure
+    with db_connect() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT note_key, package FROM synced_notes
+            WHERE note_id = %s AND user_id = %s AND NOT cloud_deleted
+        """, (note_id, user[0]))
+        row = cur.fetchone()
+    if not row:
+        return jsonify({"error": "Cloud note not found"}), 404
+    name = re.sub(r"\.md$", "", row[0], flags=re.I) + ".zip"
+    response = Response(bytes(row[1]), mimetype="application/zip")
+    response.headers["Content-Disposition"] = f'attachment; filename="{name}"'
+    return response
+
+
+@app.delete("/account/notes/<int:note_id>")
+def account_note_delete(note_id):
+    user, failure = friend_error()
+    if failure:
+        return failure
+    with db_connect() as conn, conn.cursor() as cur:
+        # Keep a marker row (same fingerprint, empty package) so the device does
+        # not immediately upload the unchanged note again.
+        cur.execute("""
+            UPDATE synced_notes SET cloud_deleted = TRUE, package = ''::bytea, updated_at = NOW()
+            WHERE note_id = %s AND user_id = %s AND NOT cloud_deleted
+        """, (note_id, user[0]))
+        deleted = cur.rowcount
+    if not deleted:
+        return jsonify({"error": "Cloud note not found"}), 404
+    return jsonify({"status": "removed from cloud"})
 
 
 if __name__ == "__main__":
