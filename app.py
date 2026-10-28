@@ -14,12 +14,14 @@ import hashlib
 import hmac
 import io
 import json
+import mmap
 import os
 import re
 import secrets
 import smtplib
 import time
 from email.message import EmailMessage
+import tempfile
 import threading
 import wave
 from concurrent.futures import ThreadPoolExecutor
@@ -49,10 +51,31 @@ MAX_AI_CONCURRENCY = int(os.environ.get("MAX_AI_CONCURRENCY", "4"))
 # Narration (Groq Orpheus TTS). Orpheus accepts fewer than 200 characters per
 # request and has low per-minute / per-day limits on small plans, so narration
 # runs as a background job that paces itself and retries after HTTP 429.
-SPEECH_MAX_CHARS = int(os.environ.get("SPEECH_MAX_CHARS", "24000"))
-SPEECH_CHUNK_CHARS = 190
+SPEECH_MAX_CHARS = int(os.environ.get("SPEECH_MAX_CHARS", "100000"))
+LEGACY_SPEECH_MAX_CHARS = 24000  # the old one-request endpoint keeps audio in memory
+SPEECH_CHUNK_CHARS = 190  # Groq Orpheus limit
 SPEECH_MAX_WAIT_SECONDS = int(os.environ.get("SPEECH_MAX_WAIT_SECONDS", "75"))
 SPEECH_TTS_ATTEMPTS = 6
+
+# Narration provider. Google Cloud Text-to-Speech is the default when
+# GOOGLE_TTS_API_KEY is set (cheap, accepts 5000 bytes per request, so a long
+# lecture needs few requests); otherwise Groq Orpheus is used. TTS_PROVIDER can
+# force "google" or "groq".
+TTS_PROVIDER = os.environ.get("TTS_PROVIDER", "").strip().lower()
+GOOGLE_TTS_API_KEY = os.environ.get("GOOGLE_TTS_API_KEY", "")
+GOOGLE_TTS_LANGUAGE = os.environ.get("GOOGLE_TTS_LANGUAGE", "en-US")
+GOOGLE_TTS_VOICE_PREMIUM = os.environ.get("GOOGLE_TTS_VOICE_PREMIUM", "en-US-Wavenet-F")   # 1M chars/month free
+GOOGLE_TTS_VOICE_STANDARD = os.environ.get("GOOGLE_TTS_VOICE_STANDARD", "en-US-Standard-F")  # 4M chars/month free
+GOOGLE_TTS_SPEAKING_RATE = float(os.environ.get("GOOGLE_TTS_SPEAKING_RATE", "1.0"))
+GOOGLE_TTS_CHUNK_CHARS = 4000  # Google's limit is 5000 bytes per request
+# Characters per month covered by Google's free tier for each voice type. The
+# backend keeps its own counter and uses the premium voice only while the whole
+# narration still fits in the free premium quota; after that it uses the
+# standard voice, and finally refuses (TTS_MONTHLY_CAP_CHARS) so that a bug or
+# misuse cannot create a surprise bill.
+TTS_PREMIUM_FREE_CHARS = int(os.environ.get("TTS_PREMIUM_FREE_CHARS", "1000000"))
+TTS_STANDARD_FREE_CHARS = int(os.environ.get("TTS_STANDARD_FREE_CHARS", "4000000"))
+TTS_MONTHLY_CAP_CHARS = int(os.environ.get("TTS_MONTHLY_CAP_CHARS", "6000000"))
 SPEECH_JOB_TTL_SECONDS = 20 * 60
 SYNC_MAX_AUDIO_BYTES = int(os.environ.get("SYNC_MAX_AUDIO_MB", "40")) * 1024 * 1024
 SMTP_HOST = os.environ.get("SMTP_HOST", "")
@@ -285,6 +308,15 @@ def ensure_db():
                 )
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS synced_audio_user_idx ON synced_audio(user_id)")
+        with db_connect() as conn, conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS tts_usage (
+                    month TEXT NOT NULL,
+                    tier TEXT NOT NULL,
+                    chars BIGINT NOT NULL DEFAULT 0,
+                    PRIMARY KEY (month, tier)
+                )
+            """)
         _db_ready = True
 
 
@@ -684,7 +716,7 @@ def _speech_sleep(seconds, job=None):
         time.sleep(min(1.0, remaining))
 
 
-def tts_chunk_pcm(chunk, job=None):
+def groq_tts_chunk_pcm(chunk, job=None):
     """One Orpheus request (< 200 chars) -> (24 kHz mono 16-bit PCM, None) or (None, error).
 
     HTTP 429 is retried after the delay Groq asks for. A delay longer than
@@ -748,6 +780,203 @@ def tts_chunk_pcm(chunk, job=None):
             continue
         return None, last
     return None, last
+
+
+class PcmStore:
+    """24 kHz mono 16-bit PCM kept in an anonymous temporary file instead of RAM.
+
+    A narration of a long lecture runs for an hour or more (about 170 MB of
+    PCM); holding that in memory would crash a small Render instance.
+    """
+
+    def __init__(self):
+        self._file = tempfile.TemporaryFile()
+        self._size = 0
+
+    def extend(self, data):
+        if self._file is None:
+            return
+        try:
+            self._file.write(data)
+        except ValueError:  # closed by a cancelled/pruned job
+            return
+        self._size += len(data)
+
+    def __len__(self):
+        return self._size
+
+    def view(self):
+        """Read-only buffer over the audio (an mmap), or b"" when empty."""
+        if self._file is None or not self._size:
+            return b""
+        self._file.flush()
+        return mmap.mmap(self._file.fileno(), self._size, access=mmap.ACCESS_READ)
+
+    def read_all(self):
+        if self._file is None or not self._size:
+            return b""
+        self._file.flush()
+        self._file.seek(0)
+        data = self._file.read(self._size)
+        self._file.seek(0, os.SEEK_END)
+        return data
+
+    def close(self):
+        # An mmap handed out by view() stays valid after the file is closed.
+        if self._file is not None:
+            try:
+                self._file.close()
+            except Exception:  # pragma: no cover
+                pass
+            self._file = None
+        self._size = 0
+
+
+# --- Narration provider selection --------------------------------------------
+def tts_provider():
+    if TTS_PROVIDER in ("google", "groq"):
+        return TTS_PROVIDER
+    return "google" if GOOGLE_TTS_API_KEY else "groq"
+
+
+def tts_key_missing():
+    return not (GOOGLE_TTS_API_KEY if tts_provider() == "google" else GROQ_API_KEY)
+
+
+def _usage_month():
+    return datetime.now(timezone.utc).strftime("%Y-%m")
+
+
+def tts_usage_chars():
+    """Bytes of text sent to Google this month: {"premium": n, "standard": n}."""
+    usage = {"premium": 0, "standard": 0}
+    ensure_db()
+    with db_connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT tier, chars FROM tts_usage WHERE month = %s", (_usage_month(),))
+        for tier, chars in cur.fetchall():
+            usage[tier] = int(chars)
+    return usage
+
+
+def record_tts_usage(tier, chars):
+    try:
+        ensure_db()
+        with db_connect() as conn, conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO tts_usage(month, tier, chars) VALUES (%s, %s, %s)
+                ON CONFLICT(month, tier) DO UPDATE SET chars = tts_usage.chars + EXCLUDED.chars
+            """, (_usage_month(), tier, int(chars)))
+    except Exception:
+        app.logger.exception("Could not record TTS usage")
+
+
+def choose_tts_plan(total_bytes):
+    """Pick provider, voice and chunk size for one whole narration.
+
+    Returns (plan, None) or (None, error). The voice is fixed for the whole
+    narration: the premium voice is used only if the entire text still fits in
+    this month's free premium quota, otherwise the standard voice is used.
+    """
+    if tts_provider() == "groq":
+        return {"provider": "groq", "tier": "groq", "voice": GROQ_TTS_VOICE,
+                "chunk_chars": SPEECH_CHUNK_CHARS}, None
+    try:
+        usage = tts_usage_chars()
+    except Exception:
+        app.logger.exception("Could not read TTS usage; using the standard voice")
+        usage = {"premium": TTS_PREMIUM_FREE_CHARS, "standard": 0}
+    if usage["premium"] + usage["standard"] + total_bytes > TTS_MONTHLY_CAP_CHARS:
+        return None, _speech_error(
+            429, f"Monthly narration limit of {TTS_MONTHLY_CAP_CHARS} characters reached", "monthly_cap")
+    premium = usage["premium"] + total_bytes <= TTS_PREMIUM_FREE_CHARS
+    return {"provider": "google", "tier": "premium" if premium else "standard",
+            "voice": GOOGLE_TTS_VOICE_PREMIUM if premium else GOOGLE_TTS_VOICE_STANDARD,
+            "chunk_chars": GOOGLE_TTS_CHUNK_CHARS}, None
+
+
+def _google_error(status, detail):
+    text = detail if isinstance(detail, str) else json.dumps(detail, ensure_ascii=False)
+    if status in (401, 403):
+        code = "auth"      # bad key, API not enabled, or billing not enabled
+    elif status == 429:
+        code = "rate_limited"
+    elif status in (408, 504):
+        code = "timeout"
+    else:
+        code = "tts_failed"
+    return {"status": status, "code": code, "message": text[:300]}
+
+
+def google_tts_chunk_pcm(chunk, plan, job=None):
+    """One Google Cloud TTS request (<= 5000 bytes) -> (24 kHz mono 16-bit PCM, None) or (None, error)."""
+    payload = {
+        "input": {"text": chunk},
+        "voice": {"languageCode": GOOGLE_TTS_LANGUAGE, "name": plan["voice"]},
+        "audioConfig": {"audioEncoding": "LINEAR16", "sampleRateHertz": 24000,
+                        "speakingRate": GOOGLE_TTS_SPEAKING_RATE},
+    }
+    last = _speech_error(503, "no attempt made", "network")
+    for attempt in range(SPEECH_TTS_ATTEMPTS):
+        if job is not None and job.get("cancel"):
+            return None, _speech_error(499, "cancelled", "cancelled")
+        try:
+            response = requests.post(
+                "https://texttospeech.googleapis.com/v1/text:synthesize", json=payload,
+                headers={"Content-Type": "application/json", "X-Goog-Api-Key": GOOGLE_TTS_API_KEY},
+                timeout=(5, 90),
+            )
+        except requests.Timeout as exc:
+            last = _speech_error(504, str(exc), "timeout")
+            if not _speech_sleep(2 * (attempt + 1), job):
+                return None, _speech_error(499, "cancelled", "cancelled")
+            continue
+        except requests.RequestException as exc:
+            last = _speech_error(503, str(exc), "network")
+            if not _speech_sleep(2 * (attempt + 1), job):
+                return None, _speech_error(499, "cancelled", "cancelled")
+            continue
+        if response.ok:
+            try:
+                audio_wav = base64.b64decode(response.json()["audioContent"])
+                with wave.open(io.BytesIO(audio_wav), "rb") as wav:
+                    if wav.getnchannels() != 1 or wav.getsampwidth() != 2 or wav.getframerate() != 24000:
+                        raise ValueError("expected 24 kHz, 16-bit mono WAV from Google TTS")
+                    audio = wav.readframes(wav.getnframes())
+                if not audio or len(audio) % 2:
+                    raise ValueError("Google returned empty or invalid 16-bit PCM data")
+                return audio, None
+            except (KeyError, ValueError, TypeError, wave.Error, EOFError) as exc:
+                return None, _google_error(502, f"Google returned invalid speech audio: {exc}")
+        try:
+            detail = response.json()
+        except ValueError:
+            detail = response.text[:1000]
+        last = _google_error(response.status_code, detail)
+        if response.status_code == 429:
+            wait = _retry_after_seconds(response)
+            if wait > SPEECH_MAX_WAIT_SECONDS:
+                last["code"] = "daily_limit"
+                return None, last
+            if not _speech_sleep(wait + 1, job):
+                return None, _speech_error(499, "cancelled", "cancelled")
+            continue
+        if response.status_code in (500, 502, 503, 504):
+            if not _speech_sleep(2 * (attempt + 1), job):
+                return None, _speech_error(499, "cancelled", "cancelled")
+            continue
+        return None, last
+    return None, last
+
+
+def tts_chunk_pcm(chunk, job=None, plan=None):
+    """One narration chunk with the provider chosen for this job -> (PCM, None) or (None, error)."""
+    plan = plan or (job or {}).get("tts")
+    if plan is not None and plan["provider"] == "google":
+        audio, error = google_tts_chunk_pcm(chunk, plan, job)
+        if audio is not None:
+            record_tts_usage(plan["tier"], len(chunk.encode("utf-8")))
+        return audio, error
+    return groq_tts_chunk_pcm(chunk, job)
 
 
 # --- 24 kHz mono -> 44.1 kHz stereo (BM83 / I2S) ------------------------------
@@ -825,12 +1054,16 @@ def wav_from_mono_pcm(pcm, rate=24000):
 
 def make_speech_mono(text):
     """Synchronous narration (used by the legacy /notes/speech endpoint)."""
-    chunks = split_speech_text(clean_text_for_speech(text))
+    cleaned = clean_text_for_speech(text)
+    plan, plan_error = choose_tts_plan(len(cleaned.encode("utf-8")))
+    if plan_error:
+        return None, plan_error
+    chunks = split_speech_text(cleaned, plan["chunk_chars"])
     if not chunks:
         return None, _speech_error(400, "No text to speak", "no_text")
     pcm = bytearray()
     for chunk in chunks:
-        audio, error = tts_chunk_pcm(chunk)
+        audio, error = tts_chunk_pcm(chunk, plan=plan)
         if error:
             return None, error
         pcm.extend(audio)
@@ -845,9 +1078,9 @@ def store_cloud_narration(job):
     profile_id, note_key = job.get("profile_id", ""), job.get("note_key", "")
     if not profile_id or not note_key:
         return "skipped"
-    wav = wav_from_mono_pcm(job["pcm"])
-    if len(wav) > SYNC_MAX_AUDIO_BYTES:
+    if len(job["pcm"]) + 44 > SYNC_MAX_AUDIO_BYTES:
         return "too_large"
+    wav = wav_from_mono_pcm(job["pcm"].read_all())
     try:
         with db_connect() as conn, conn.cursor() as cur:
             cur.execute("SELECT user_id FROM device_profile_links WHERE device_id = %s AND profile_id = %s",
@@ -1398,6 +1631,7 @@ def _prune_speech_jobs():
         if finished_old or stuck:
             job["cancel"] = True
             del _speech_jobs[job_id]
+            job["pcm"].close()
 
 
 def _speech_job_for(device_id, job_id):
@@ -1431,13 +1665,17 @@ def _run_speech_job(job_id, chunks):
         job["audio_bytes"] = speech_stereo_size(len(job["pcm"]))
         job["cloud"] = store_cloud_narration(job)
         job["state"] = "done"
+        plan = job.get("tts") or {}
+        app.logger.info("Narration job %s done: provider=%s tier=%s voice=%s chunks=%d audio=%d s",
+                        job_id, plan.get("provider"), plan.get("tier"), plan.get("voice"),
+                        len(chunks), len(job["pcm"]) // 2 // 24000)
     except Exception:
         app.logger.exception("Narration job %s crashed", job_id)
         job.update(state="failed", error="server_error", message="Narration job crashed")
     finally:
         job["touched"] = time.time()
         if job["state"] != "done":
-            job["pcm"] = bytearray()  # free memory of unfinished jobs
+            job["pcm"].close()  # free the temp file of unfinished jobs
 
 
 @app.post("/notes/speech/start")
@@ -1449,10 +1687,13 @@ def start_note_speech():
     text = data.get("text", "") if isinstance(data, dict) else ""
     if not isinstance(text, str) or not text.strip() or len(text) > SPEECH_MAX_CHARS:
         return jsonify({"error": f"Text must contain 1 to {SPEECH_MAX_CHARS} characters", "code": "bad_text"}), 400
-    if not GROQ_API_KEY:
-        return jsonify({"error": "groq_api_key_missing", "code": "groq_key_missing"}), 503
+    if tts_key_missing():
+        return jsonify({"error": "tts_api_key_missing", "code": "tts_key_missing"}), 503
     cleaned = clean_text_for_speech(text)
-    chunks = split_speech_text(cleaned)
+    plan, plan_error = choose_tts_plan(len(cleaned.encode("utf-8")))
+    if plan_error:
+        return jsonify({"error": plan_error["message"], "code": plan_error["code"]}), 429
+    chunks = split_speech_text(cleaned, plan["chunk_chars"])
     if not chunks:
         return jsonify({"error": "No speakable text", "code": "no_text"}), 400
     profile_id = request.headers.get("x-profile-id", "")
@@ -1465,7 +1706,7 @@ def start_note_speech():
     job_id = secrets.token_urlsafe(12)
     job = {"id": job_id, "device_id": device_id, "profile_id": profile_id, "note_key": note_key,
            "state": "running", "done": 0, "total": len(chunks), "error": "", "message": "",
-           "upstream_status": 0, "pcm": bytearray(), "audio_bytes": 0, "cloud": "",
+           "upstream_status": 0, "pcm": PcmStore(), "audio_bytes": 0, "cloud": "", "tts": plan,
            "cancel": False, "created": now, "touched": now}
     with _speech_lock:
         _prune_speech_jobs()
@@ -1473,8 +1714,11 @@ def start_note_speech():
             if old["device_id"] == device_id:  # one narration per device at a time
                 old["cancel"] = True
                 del _speech_jobs[old_id]
+                old["pcm"].close()
         _speech_jobs[job_id] = job
     _speech_pool.submit(_run_speech_job, job_id, chunks)
+    app.logger.info("Narration job %s started: provider=%s tier=%s voice=%s chars=%d chunks=%d",
+                    job_id, plan["provider"], plan["tier"], plan["voice"], len(cleaned), len(chunks))
     return jsonify({"job_id": job_id, "chunks": len(chunks), "chars": len(cleaned)}), 202
 
 
@@ -1503,7 +1747,7 @@ def note_speech_audio(job_id):
     if job["state"] != "done":
         return jsonify({"error": "Narration is not ready", "code": "not_ready"}), 409
     job["touched"] = time.time()
-    response = Response(iter_speech_stereo(job["pcm"]), mimetype="audio/L16")
+    response = Response(iter_speech_stereo(job["pcm"].view()), mimetype="audio/L16")
     response.headers["Content-Length"] = str(job["audio_bytes"])
     response.headers["X-Sample-Rate"] = "44100"
     response.headers["X-Audio-Channels"] = "2"
@@ -1520,6 +1764,7 @@ def delete_note_speech(job_id):
         if job is not None and job["device_id"] == device_id:
             job["cancel"] = True
             del _speech_jobs[job_id]
+            job["pcm"].close()
     return "", 204
 
 
@@ -1531,17 +1776,17 @@ def speak_note():
         return failure
     data = request.get_json(silent=True)
     text = data.get("text", "") if isinstance(data, dict) else ""
-    if not isinstance(text, str) or not text.strip() or len(text) > SPEECH_MAX_CHARS:
-        return jsonify({"error": f"Text must contain 1 to {SPEECH_MAX_CHARS} characters"}), 400
-    if not GROQ_API_KEY:
-        return jsonify({"error": "groq_api_key_missing"}), 503
+    if not isinstance(text, str) or not text.strip() or len(text) > LEGACY_SPEECH_MAX_CHARS:
+        return jsonify({"error": f"Text must contain 1 to {LEGACY_SPEECH_MAX_CHARS} characters"}), 400
+    if tts_key_missing():
+        return jsonify({"error": "tts_api_key_missing"}), 503
     if not _ai_slots.acquire(blocking=False):
         return jsonify({"error": "ai_busy"}), 429
     try:
         mono, error = make_speech_mono(text.strip())
         if error:
             app.logger.warning("Note speech generation failed: %s", error)
-            status = 429 if error["code"] in ("rate_limited", "daily_limit") else 502
+            status = 429 if error["code"] in ("rate_limited", "daily_limit", "monthly_cap") else 502
             return jsonify({"error": "speech_generation_failed", "code": error["code"],
                             "detail": error["message"]}), status
         response = Response(iter_speech_stereo(mono), mimetype="audio/L16")
@@ -2249,12 +2494,17 @@ def device_sync_list():
         return err
     device_id = request.headers.get("x-device-id", "")
     profile_id = request.headers.get("x-profile-id", "")
+    # A manual "Sync to cloud" on the device asks to restore notes that were
+    # removed from the cloud: they are left out of the list so the device sends
+    # them again. Automatic syncs keep respecting the removal.
+    restore_removed = request.headers.get("x-sync-restore", "") == "1"
     try:
         with db_connect() as conn, conn.cursor() as cur:
             cur.execute("""
                 SELECT note_key, note_crc, note_size FROM synced_notes
                 WHERE device_id = %s AND profile_id = %s AND user_id = %s
-            """, (device_id, profile_id, owner))
+                  AND (NOT cloud_deleted OR NOT %s)
+            """, (device_id, profile_id, owner, restore_removed))
             rows = cur.fetchall()
         return jsonify({"notes": [{"key": r[0], "crc": int(r[1]), "size": int(r[2])} for r in rows]})
     except Exception:
