@@ -4,3 +4,5 @@ requests
 psycopg2-binary
 reportlab>=4.2,<5
 numpy>=1.26
+edge-tts>=7.0.0
+miniaudio>=1.59
