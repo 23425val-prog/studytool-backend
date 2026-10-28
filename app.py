@@ -48,24 +48,25 @@ GROQ_VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "qwen/qwen3.8-27b")
 GROQ_TTS_MODEL = os.environ.get("GROQ_TTS_MODEL", "canopylabs/orpheus-v1-english")
 GROQ_TTS_VOICE = os.environ.get("GROQ_TTS_VOICE", "autumn")
 MAX_AI_CONCURRENCY = int(os.environ.get("MAX_AI_CONCURRENCY", "16"))
-# Narration (Groq Orpheus TTS). Orpheus accepts fewer than 200 characters per
-# request and has low per-minute / per-day limits on small plans, so narration
-# runs as a background job that paces itself and retries after HTTP 429.
+# Narration runs as a background job that paces itself and retries after HTTP 429.
+# (Groq Orpheus, used only with TTS_PROVIDER=groq, accepts fewer than 200 characters
+# per request and has low per-minute / per-day limits on small plans.)
 SPEECH_MAX_CHARS = int(os.environ.get("SPEECH_MAX_CHARS", "100000"))
 LEGACY_SPEECH_MAX_CHARS = 24000  # the old one-request endpoint keeps audio in memory
 SPEECH_CHUNK_CHARS = 190  # Groq Orpheus limit
 SPEECH_MAX_WAIT_SECONDS = int(os.environ.get("SPEECH_MAX_WAIT_SECONDS", "75"))
 SPEECH_TTS_ATTEMPTS = 6
 
-# Narration provider: Google Cloud Text-to-Speech. WaveNet and Standard voices cost
-# the same ($4 per 1M characters, 4M characters free per month), and a request takes
-# up to 5000 bytes, so a long lecture needs few requests. Groq Orpheus ($22 per 1M
-# characters, 200 characters per request, small daily quota) is used only when
-# TTS_PROVIDER=groq is set explicitly. A missing Google key is reported as an error
-# instead of silently falling back to the expensive provider.
-# TTS_PROVIDER: "edge" (default; no key and no card, unofficial Microsoft Edge neural
-# voices through the edge-tts package), "azure" (official Azure AI Speech, free F0 tier of
-# 500,000 characters per month), "google" (Google Cloud TTS) or "groq" (Orpheus).
+# Narration provider, chosen with TTS_PROVIDER:
+#   "edge"   (default) no key and no card: unofficial Microsoft Edge neural voices through
+#            the edge-tts package; Microsoft can change or block this endpoint at any time.
+#   "azure"  official Azure AI Speech (free F0 tier of 500,000 characters per month).
+#   "google" Google Cloud Text-to-Speech (WaveNet/Standard 4 USD per 1M characters, 4M free
+#            per month; up to 5000 bytes per request).
+#   "groq"   Orpheus (22 USD per 1M characters, under 200 characters per request, small
+#            daily quota); used only when selected explicitly.
+# A missing key for the selected provider is reported as an error, never as a silent
+# fallback to another provider.
 TTS_PROVIDER = os.environ.get("TTS_PROVIDER", "edge").strip().lower()
 EDGE_TTS_VOICE = os.environ.get("EDGE_TTS_VOICE", "en-US-AriaNeural")
 EDGE_TTS_RATE = os.environ.get("EDGE_TTS_RATE", "+0%")  # e.g. "-10%" for slower speech
@@ -85,9 +86,9 @@ GOOGLE_TTS_CHUNK_CHARS = 4000  # Google's limit is 5000 bytes per request
 # upsamples to the 44.1 kHz stereo the BM83 needs while it plays. Keep this value
 # equal to SPEECH_FILE_RATE in LectureMode.cpp.
 SPEECH_RATE = 22050
-# Safety limits in characters. The backend counts what it sends to Google; Google's own
-# billing is authoritative. TTS_MONTHLY_CAP_CHARS stops all narration for the month
-# (default 5 M: at most about 4 USD above the 4 M free characters).
+# Safety limits in characters. The backend counts what it sends to the provider (the
+# provider's own billing is authoritative). TTS_MONTHLY_CAP_CHARS stops all narration for
+# the month (default 5 M, 480,000 for azure; groq is not counted).
 # TTS_DEVICE_MONTHLY_CHARS limits one device per month (0 = no per-device limit;
 # 270000 is about 5 lectures of 100 minutes).
 # Default monthly cap per provider (characters). Azure F0 stops at 500,000 anyway, so
@@ -2788,8 +2789,8 @@ def download_shared_note(note_id):
 #
 # The device is the source of truth: it uploads each saved note (Markdown plus
 # linked photos, no narration WAV) as a ZIP. Deleting a note on the device never
-# deletes the cloud copy. The phone can hide a cloud copy; that leaves a small
-# marker so the device does not upload the same unchanged note again.
+# deletes the cloud copy. The phone can remove a cloud copy; the device uploads it
+# again at its next sync as long as the note still exists on the device.
 # ---------------------------------------------------------------------------
 SYNC_MAX_PACKAGE_BYTES = 9 * 1024 * 1024
 SYNC_MAX_USER_BYTES = int(os.environ.get("SYNC_MAX_USER_MB", "300")) * 1024 * 1024
@@ -2811,17 +2812,16 @@ def device_sync_list():
         return err
     device_id = request.headers.get("x-device-id", "")
     profile_id = request.headers.get("x-profile-id", "")
-    # A manual "Sync to cloud" on the device asks to restore notes that were
-    # removed from the cloud: they are left out of the list so the device sends
-    # them again. Automatic syncs keep respecting the removal.
-    restore_removed = request.headers.get("x-sync-restore", "") == "1"
+    # Notes removed from the cloud in the phone app are left out of this list, so the
+    # device uploads them again at its next sync (automatic or manual). Removing a cloud
+    # copy therefore never makes a note that still exists on the device disappear for good.
     try:
         with db_connect() as conn, conn.cursor() as cur:
             cur.execute("""
                 SELECT note_key, note_crc, note_size FROM synced_notes
                 WHERE device_id = %s AND profile_id = %s AND user_id = %s
-                  AND (NOT cloud_deleted OR NOT %s)
-            """, (device_id, profile_id, owner, restore_removed))
+                  AND NOT cloud_deleted
+            """, (device_id, profile_id, owner))
             rows = cur.fetchall()
         return jsonify({"notes": [{"key": r[0], "crc": int(r[1]), "size": int(r[2])} for r in rows]})
     except Exception:
@@ -2957,8 +2957,8 @@ def account_note_delete(note_id):
     if failure:
         return failure
     with db_connect() as conn, conn.cursor() as cur:
-        # Keep a marker row (same fingerprint, empty package) so the device does
-        # not immediately upload the unchanged note again.
+        # Keep a marker row (empty package) to free the space; the device sees the note
+        # as missing in the cloud and uploads it again at its next sync.
         cur.execute("""
             UPDATE synced_notes SET cloud_deleted = TRUE, package = ''::bytea, updated_at = NOW()
             WHERE note_id = %s AND user_id = %s AND NOT cloud_deleted
