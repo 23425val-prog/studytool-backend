@@ -63,7 +63,17 @@ SPEECH_TTS_ATTEMPTS = 6
 # characters, 200 characters per request, small daily quota) is used only when
 # TTS_PROVIDER=groq is set explicitly. A missing Google key is reported as an error
 # instead of silently falling back to the expensive provider.
-TTS_PROVIDER = os.environ.get("TTS_PROVIDER", "google").strip().lower()
+# TTS_PROVIDER: "edge" (default; no key and no card, unofficial Microsoft Edge neural
+# voices through the edge-tts package), "azure" (official Azure AI Speech, free F0 tier of
+# 500,000 characters per month), "google" (Google Cloud TTS) or "groq" (Orpheus).
+TTS_PROVIDER = os.environ.get("TTS_PROVIDER", "edge").strip().lower()
+EDGE_TTS_VOICE = os.environ.get("EDGE_TTS_VOICE", "en-US-AriaNeural")
+EDGE_TTS_RATE = os.environ.get("EDGE_TTS_RATE", "+0%")  # e.g. "-10%" for slower speech
+EDGE_TTS_CHUNK_CHARS = 3000
+AZURE_TTS_KEY = os.environ.get("AZURE_TTS_KEY", "")
+AZURE_TTS_REGION = os.environ.get("AZURE_TTS_REGION", "")  # e.g. "eastus"
+AZURE_TTS_VOICE = os.environ.get("AZURE_TTS_VOICE", "en-US-AriaNeural")
+AZURE_TTS_CHUNK_CHARS = 2500
 GOOGLE_TTS_API_KEY = os.environ.get("GOOGLE_TTS_API_KEY", "")
 GOOGLE_TTS_LANGUAGE = os.environ.get("GOOGLE_TTS_LANGUAGE", "en-US")
 GOOGLE_TTS_VOICE = (os.environ.get("GOOGLE_TTS_VOICE") or os.environ.get("GOOGLE_TTS_VOICE_PREMIUM")
@@ -80,9 +90,19 @@ SPEECH_RATE = 22050
 # (default 5 M: at most about 4 USD above the 4 M free characters).
 # TTS_DEVICE_MONTHLY_CHARS limits one device per month (0 = no per-device limit;
 # 270000 is about 5 lectures of 100 minutes).
-TTS_MONTHLY_CAP_CHARS = int(os.environ.get("TTS_MONTHLY_CAP_CHARS", "5000000"))
+# Default monthly cap per provider (characters). Azure F0 stops at 500,000 anyway, so
+# the default stays below it. Override with TTS_MONTHLY_CAP_CHARS.
+_TTS_CAP_ENV = os.environ.get("TTS_MONTHLY_CAP_CHARS", "").strip()
+TTS_MONTHLY_CAP_CHARS = int(_TTS_CAP_ENV) if _TTS_CAP_ENV else None
+TTS_DEFAULT_CAPS = {"azure": 480000}
 TTS_DEVICE_MONTHLY_CHARS = int(os.environ.get("TTS_DEVICE_MONTHLY_CHARS", "0"))
 SPEECH_JOB_TTL_SECONDS = 20 * 60
+# Lecture recording limits, in minutes per day (0 = unlimited). The device limit protects
+# your Groq quota and costs; the global limit caps the whole service. The day changes at
+# 00:00 UTC plus LIMIT_DAY_UTC_OFFSET_HOURS.
+LECTURE_DAILY_MINUTES = int(os.environ.get("LECTURE_DAILY_MINUTES", "60"))
+LECTURE_GLOBAL_DAILY_MINUTES = int(os.environ.get("LECTURE_GLOBAL_DAILY_MINUTES", "0"))
+LIMIT_DAY_UTC_OFFSET_HOURS = int(os.environ.get("LIMIT_DAY_UTC_OFFSET_HOURS", "0"))
 SYNC_MAX_AUDIO_BYTES = int(os.environ.get("SYNC_MAX_AUDIO_MB", "40")) * 1024 * 1024
 SMTP_HOST = os.environ.get("SMTP_HOST", "")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
@@ -324,6 +344,14 @@ def ensure_db():
                 )
             """)
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS lecture_usage (
+                    day TEXT NOT NULL,
+                    device_id TEXT NOT NULL,
+                    seconds BIGINT NOT NULL DEFAULT 0,
+                    PRIMARY KEY (day, device_id)
+                )
+            """)
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS tts_device_usage (
                     month TEXT NOT NULL,
                     device_id TEXT NOT NULL,
@@ -451,6 +479,65 @@ def authorized(device_id, token):
         cur.execute("SELECT token_hash FROM devices WHERE device_id = %s", (device_id,))
         row = cur.fetchone()
     return row is not None and hmac.compare_digest(row[0], hash_token(token))
+
+
+def _limit_day():
+    """Date string of the current limit day (UTC plus LIMIT_DAY_UTC_OFFSET_HOURS)."""
+    now = datetime.now(timezone.utc).timestamp() + LIMIT_DAY_UTC_OFFSET_HOURS * 3600
+    return datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d")
+
+
+def wav_seconds(audio):
+    """Duration of a WAV upload in whole seconds (rounded up, at least 1)."""
+    try:
+        with wave.open(io.BytesIO(audio), "rb") as wav:
+            rate = wav.getframerate() or 16000
+            return max(1, -(-wav.getnframes() // rate))
+    except Exception:
+        return max(1, -(-max(0, len(audio) - 44) // 32000))  # 16 kHz, mono, 16-bit
+
+
+def lecture_usage_seconds(device_id):
+    """(device seconds, all-devices seconds) recorded today."""
+    ensure_db()
+    day = _limit_day()
+    with db_connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT COALESCE(SUM(seconds), 0) FROM lecture_usage WHERE day = %s AND device_id = %s",
+                    (day, device_id))
+        device = int(cur.fetchone()[0])
+        total = device
+        if LECTURE_GLOBAL_DAILY_MINUTES > 0:
+            cur.execute("SELECT COALESCE(SUM(seconds), 0) FROM lecture_usage WHERE day = %s", (day,))
+            total = int(cur.fetchone()[0])
+    return device, total
+
+
+def lecture_quota_state(device_id):
+    """Remaining lecture seconds today, or None when there is no limit at all."""
+    if LECTURE_DAILY_MINUTES <= 0 and LECTURE_GLOBAL_DAILY_MINUTES <= 0:
+        return None
+    device, total = lecture_usage_seconds(device_id)
+    remaining = []
+    if LECTURE_DAILY_MINUTES > 0:
+        remaining.append(LECTURE_DAILY_MINUTES * 60 - device)
+    if LECTURE_GLOBAL_DAILY_MINUTES > 0:
+        remaining.append(LECTURE_GLOBAL_DAILY_MINUTES * 60 - total)
+    return {
+        "limit_seconds": LECTURE_DAILY_MINUTES * 60,
+        "used_seconds": device,
+        "remaining_seconds": max(0, min(remaining)),
+        "global_limit_reached": LECTURE_GLOBAL_DAILY_MINUTES > 0
+                                and total >= LECTURE_GLOBAL_DAILY_MINUTES * 60,
+    }
+
+
+def add_lecture_usage(device_id, seconds):
+    ensure_db()
+    with db_connect() as conn, conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO lecture_usage(day, device_id, seconds) VALUES (%s, %s, %s)
+            ON CONFLICT(day, device_id) DO UPDATE SET seconds = lecture_usage.seconds + EXCLUDED.seconds
+        """, (_limit_day(), device_id, int(seconds)))
 
 
 def result_for(device_id, segment_id):
@@ -883,22 +970,36 @@ class PcmStore:
 
 # --- Narration provider selection --------------------------------------------
 def tts_provider():
-    return "groq" if TTS_PROVIDER == "groq" else "google"
+    return TTS_PROVIDER if TTS_PROVIDER in ("edge", "azure", "google", "groq") else "edge"
 
 
 def tts_key_missing():
-    return not (GOOGLE_TTS_API_KEY if tts_provider() == "google" else GROQ_API_KEY)
+    provider = tts_provider()
+    if provider == "google":
+        return not GOOGLE_TTS_API_KEY
+    if provider == "groq":
+        return not GROQ_API_KEY
+    if provider == "azure":
+        return not (AZURE_TTS_KEY and AZURE_TTS_REGION)
+    return False  # edge needs no key
+
+
+def tts_monthly_cap(provider):
+    if TTS_MONTHLY_CAP_CHARS is not None:
+        return TTS_MONTHLY_CAP_CHARS
+    return TTS_DEFAULT_CAPS.get(provider, 5000000)
 
 
 def _usage_month():
     return datetime.now(timezone.utc).strftime("%Y-%m")
 
 
-def tts_usage_chars():
-    """Characters of text sent to Google this month (all voices)."""
+def tts_usage_chars(tier):
+    """Characters of text sent to one provider this month."""
     ensure_db()
     with db_connect() as conn, conn.cursor() as cur:
-        cur.execute("SELECT COALESCE(SUM(chars), 0) FROM tts_usage WHERE month = %s", (_usage_month(),))
+        cur.execute("SELECT COALESCE(SUM(chars), 0) FROM tts_usage WHERE month = %s AND tier = %s",
+                    (_usage_month(), tier))
         return int(cur.fetchone()[0])
 
 
@@ -935,17 +1036,19 @@ def choose_tts_plan(total_bytes, device_id=""):
     Returns (plan, None) or (None, error). Refuses the narration when the monthly
     cap, or the optional per-device monthly limit, would be exceeded.
     """
-    if tts_provider() == "groq":
+    provider = tts_provider()
+    if provider == "groq":
         return {"provider": "groq", "tier": "groq", "voice": GROQ_TTS_VOICE,
                 "chunk_chars": SPEECH_CHUNK_CHARS}, None
+    cap = tts_monthly_cap(provider)
     try:
-        used = tts_usage_chars()
+        used = tts_usage_chars(provider)
     except Exception:
         app.logger.exception("Could not read TTS usage; the monthly cap was not checked")
         used = 0
-    if used + total_bytes > TTS_MONTHLY_CAP_CHARS:
+    if used + total_bytes > cap:
         return None, _speech_error(
-            429, f"Monthly narration limit of {TTS_MONTHLY_CAP_CHARS} characters reached", "monthly_cap")
+            429, f"Monthly narration limit of {cap} characters reached", "monthly_cap")
     if TTS_DEVICE_MONTHLY_CHARS > 0 and device_id:
         try:
             device_used = tts_device_usage_chars(device_id)
@@ -956,8 +1059,11 @@ def choose_tts_plan(total_bytes, device_id=""):
             return None, _speech_error(
                 429, f"This device reached its monthly narration limit of {TTS_DEVICE_MONTHLY_CHARS} characters",
                 "device_cap")
-    return {"provider": "google", "tier": "google", "voice": GOOGLE_TTS_VOICE,
-            "chunk_chars": GOOGLE_TTS_CHUNK_CHARS}, None
+    voices = {"edge": EDGE_TTS_VOICE, "azure": AZURE_TTS_VOICE, "google": GOOGLE_TTS_VOICE}
+    chunks = {"edge": EDGE_TTS_CHUNK_CHARS, "azure": AZURE_TTS_CHUNK_CHARS,
+              "google": GOOGLE_TTS_CHUNK_CHARS}
+    return {"provider": provider, "tier": provider, "voice": voices[provider],
+            "chunk_chars": chunks[provider]}, None
 
 
 def _google_error(status, detail):
@@ -1034,15 +1140,125 @@ def google_tts_chunk_pcm(chunk, plan, job=None):
     return None, last
 
 
+def azure_tts_chunk_pcm(chunk, plan, job=None):
+    """One Azure AI Speech request -> (SPEECH_RATE mono 16-bit PCM, None) or (None, error)."""
+    from xml.sax.saxutils import escape
+    voice = plan["voice"]
+    lang = "-".join(voice.split("-")[:2]) or "en-US"
+    ssml = (f"<speak version='1.0' xml:lang='{lang}'><voice name='{escape(voice)}'>"
+            f"{escape(chunk)}</voice></speak>")
+    url = f"https://{AZURE_TTS_REGION}.tts.speech.microsoft.com/cognitiveservices/v1"
+    headers = {
+        "Ocp-Apim-Subscription-Key": AZURE_TTS_KEY,
+        "Content-Type": "application/ssml+xml",
+        "X-Microsoft-OutputFormat": "riff-24khz-16bit-mono-pcm",
+        "User-Agent": "StudyTool",
+    }
+    last = _speech_error(503, "no attempt made", "network")
+    for attempt in range(SPEECH_TTS_ATTEMPTS):
+        if job is not None and job.get("cancel"):
+            return None, _speech_error(499, "cancelled", "cancelled")
+        try:
+            response = requests.post(url, data=ssml.encode("utf-8"), headers=headers, timeout=(5, 90))
+        except requests.Timeout as exc:
+            last = _speech_error(504, str(exc), "timeout")
+            if not _speech_sleep(2 * (attempt + 1), job):
+                return None, _speech_error(499, "cancelled", "cancelled")
+            continue
+        except requests.RequestException as exc:
+            last = _speech_error(503, str(exc), "network")
+            if not _speech_sleep(2 * (attempt + 1), job):
+                return None, _speech_error(499, "cancelled", "cancelled")
+            continue
+        if response.ok:
+            try:
+                with wave.open(io.BytesIO(response.content), "rb") as wav:
+                    if wav.getnchannels() != 1 or wav.getsampwidth() != 2:
+                        raise ValueError("expected 16-bit mono WAV from Azure TTS")
+                    rate = wav.getframerate()
+                    audio = wav.readframes(wav.getnframes())
+                if not audio or len(audio) % 2:
+                    raise ValueError("Azure returned empty or invalid 16-bit PCM data")
+                return resample_mono_pcm(audio, rate, SPEECH_RATE), None
+            except (ValueError, wave.Error, EOFError) as exc:
+                return None, _speech_error(502, f"Azure returned invalid speech audio: {exc}", "tts_failed")
+        last = _google_error(response.status_code, response.text[:500])  # same status -> code mapping
+        if response.status_code == 429:
+            wait = _retry_after_seconds(response)
+            if wait > SPEECH_MAX_WAIT_SECONDS:
+                last["code"] = "daily_limit"
+                return None, last
+            if not _speech_sleep(wait + 1, job):
+                return None, _speech_error(499, "cancelled", "cancelled")
+            continue
+        if response.status_code in (500, 502, 503, 504):
+            if not _speech_sleep(2 * (attempt + 1), job):
+                return None, _speech_error(499, "cancelled", "cancelled")
+            continue
+        return None, last
+    return None, last
+
+
+def edge_tts_chunk_pcm(chunk, plan, job=None):
+    """One Microsoft Edge read-aloud request (edge-tts package) -> (PCM, None) or (None, error).
+
+    Unofficial endpoint: no key and no card, but Microsoft can change or block it at any
+    time. The audio arrives as MP3 and is decoded to SPEECH_RATE mono PCM with miniaudio.
+    """
+    try:
+        import asyncio
+        import edge_tts
+        import miniaudio
+    except ImportError as exc:
+        return None, _speech_error(503, f"edge-tts or miniaudio is not installed: {exc}", "tts_failed")
+
+    async def fetch():
+        communicate = edge_tts.Communicate(chunk, plan["voice"], rate=EDGE_TTS_RATE)
+        data = bytearray()
+        async for item in communicate.stream():
+            if item["type"] == "audio":
+                data += item["data"]
+        return bytes(data)
+
+    last = _speech_error(503, "no attempt made", "network")
+    for attempt in range(SPEECH_TTS_ATTEMPTS):
+        if job is not None and job.get("cancel"):
+            return None, _speech_error(499, "cancelled", "cancelled")
+        try:
+            mp3 = asyncio.run(asyncio.wait_for(fetch(), timeout=90))
+            if not mp3:
+                raise ValueError("no audio returned")
+            decoded = miniaudio.decode(mp3, output_format=miniaudio.SampleFormat.SIGNED16,
+                                       nchannels=1, sample_rate=SPEECH_RATE)
+            audio = decoded.samples.tobytes()
+            if not audio or len(audio) % 2:
+                raise ValueError("empty or invalid decoded audio")
+            return audio, None
+        except Exception as exc:  # network errors, 403 from Microsoft, decode errors
+            text = f"{type(exc).__name__}: {exc}"
+            code = "auth" if "403" in text or "401" in text else "tts_failed"
+            last = _speech_error(502, text, code)
+            app.logger.warning("edge-tts attempt %d failed: %s", attempt + 1, text)
+            if not _speech_sleep(2 * (attempt + 1), job):
+                return None, _speech_error(499, "cancelled", "cancelled")
+    return None, last
+
+
 def tts_chunk_pcm(chunk, job=None, plan=None):
     """One narration chunk with the provider chosen for this job -> (PCM, None) or (None, error)."""
     plan = plan or (job or {}).get("tts")
-    if plan is not None and plan["provider"] == "google":
+    provider = plan["provider"] if plan is not None else "groq"
+    if provider == "groq":
+        return groq_tts_chunk_pcm(chunk, job)
+    if provider == "azure":
+        audio, error = azure_tts_chunk_pcm(chunk, plan, job)
+    elif provider == "edge":
+        audio, error = edge_tts_chunk_pcm(chunk, plan, job)
+    else:
         audio, error = google_tts_chunk_pcm(chunk, plan, job)
-        if audio is not None:
-            record_tts_usage(plan["tier"], len(chunk.encode("utf-8")), (job or {}).get("device_id", ""))
-        return audio, error
-    return groq_tts_chunk_pcm(chunk, job)
+    if audio is not None:
+        record_tts_usage(plan["tier"], len(chunk.encode("utf-8")), (job or {}).get("device_id", ""))
+    return audio, error
 
 
 # --- SPEECH_RATE (22.05 kHz) mono -> 44.1 kHz stereo (legacy /notes/speech only) ---
@@ -1930,6 +2146,15 @@ def process_audio():
         return jsonify({"error": "Invalid WAV data"}), 400
     if not GROQ_API_KEY:
         return jsonify({"error": "groq_api_key_missing"}), 503
+    quota = None
+    try:
+        quota = lecture_quota_state(device_id)
+    except Exception:
+        app.logger.exception("Could not read the lecture quota; the daily limit was not checked")
+    if quota is not None and quota["remaining_seconds"] <= 0:
+        code = "global_daily_limit" if quota["global_limit_reached"] else "daily_limit"
+        return jsonify({"error": "Daily lecture limit reached", "code": code,
+                        "limit_seconds": quota["limit_seconds"], "remaining_seconds": 0}), 429
     if not _ai_slots.acquire(blocking=False):
         return jsonify({"error": "Server is busy", "retry_after_seconds": 10}), 429
     try:
@@ -1950,10 +2175,20 @@ def process_audio():
             if existing.get("state") == "failed":
                 return jsonify({"error": "Segment processing failed", "detail": existing.get("error", "No failure detail was stored")}), 410
             return jsonify(existing)
+        seconds = wav_seconds(audio)
         _audio_jobs.submit(process_audio_job, device_id, segment_id, audio)
+        reply = {"segment_id": segment_id, "state": "processing"}
+        try:
+            add_lecture_usage(device_id, seconds)
+            if quota is not None:
+                # The segment that crosses the limit is still processed; the device is
+                # told that nothing is left so that it stops recording.
+                reply["remaining_seconds"] = max(0, quota["remaining_seconds"] - seconds)
+        except Exception:
+            app.logger.exception("Could not record lecture usage")
         # The complete request has arrived. The device may erase its local WAV
         # while the server processes its in-memory copy.
-        return jsonify({"segment_id": segment_id, "state": "processing"}), 202
+        return jsonify(reply), 202
     except Exception:
         app.logger.exception("Lecture audio processing failed")
         set_result_failed(device_id, segment_id, "Could not queue audio processing; see backend log")
@@ -1994,6 +2229,22 @@ def process_audio_job(device_id, segment_id, audio):
         set_result_failed(device_id, segment_id, "Background lecture task failed; see backend traceback")
     finally:
         _ai_slots.release()
+
+
+@app.get("/lecture/quota")
+def lecture_quota():
+    device_id = request.headers.get("x-device-id", "")
+    token = request.headers.get("x-device-token", "")
+    try:
+        if not authorized(device_id, token):
+            return jsonify({"error": "Invalid device credentials"}), 401
+        quota = lecture_quota_state(device_id)
+    except Exception:
+        app.logger.exception("Lecture quota lookup failed")
+        return jsonify({"error": "Quota unavailable"}), 503
+    if quota is None:
+        return jsonify({"unlimited": True, "remaining_seconds": -1})
+    return jsonify({"unlimited": False, **quota})
 
 
 @app.get("/lecture/result/<segment_id>")
