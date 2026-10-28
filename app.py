@@ -104,6 +104,8 @@ SPEECH_JOB_TTL_SECONDS = 20 * 60
 LECTURE_DAILY_MINUTES = int(os.environ.get("LECTURE_DAILY_MINUTES", "60"))
 LECTURE_GLOBAL_DAILY_MINUTES = int(os.environ.get("LECTURE_GLOBAL_DAILY_MINUTES", "0"))
 LIMIT_DAY_UTC_OFFSET_HOURS = int(os.environ.get("LIMIT_DAY_UTC_OFFSET_HOURS", "0"))
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "")  # protects /admin/firmware (unset = disabled)
+FIRMWARE_MAX_BYTES = 0x330000  # size of one app slot in the "8M with spiffs" partition scheme
 SYNC_MAX_AUDIO_BYTES = int(os.environ.get("SYNC_MAX_AUDIO_MB", "40")) * 1024 * 1024
 SMTP_HOST = os.environ.get("SMTP_HOST", "")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
@@ -335,6 +337,18 @@ def ensure_db():
                 )
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS synced_audio_user_idx ON synced_audio(user_id)")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS firmware_releases (
+                    version INTEGER PRIMARY KEY,
+                    firmware BYTEA NOT NULL,
+                    size INTEGER NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    notes TEXT NOT NULL DEFAULT '',
+                    rollout_percent INTEGER NOT NULL DEFAULT 100,
+                    active BOOLEAN NOT NULL DEFAULT TRUE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
         with db_connect() as conn, conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS tts_usage (
@@ -2975,6 +2989,171 @@ def account_note_delete(note_id):
     if not deleted:
         return jsonify({"error": "Cloud note not found"}), 404
     return jsonify({"status": "removed from cloud"})
+
+
+# ---------------------------------------------------------------------------
+# Firmware updates over the air. Releases are stored in PostgreSQL (a firmware image is
+# about 1.5 MB). The device asks /firmware/check with its current version and downloads
+# /firmware/download only after the server offered an update. Upload and manage releases
+# with tools/release_firmware.py (needs ADMIN_SECRET on the server).
+# ---------------------------------------------------------------------------
+def _firmware_device():
+    device_id = request.headers.get("x-device-id", "")
+    token = request.headers.get("x-device-token", "")
+    try:
+        if not authorized(device_id, token):
+            return None, (jsonify({"error": "Invalid device credentials"}), 401)
+    except Exception:
+        app.logger.exception("Firmware authorization failed")
+        return None, (jsonify({"error": "Authorization unavailable"}), 503)
+    return device_id, None
+
+
+def _in_rollout(device_id, version, percent):
+    """Stable per-device, per-release bucket 0-99; the device is offered the release when below percent."""
+    bucket = int(hashlib.sha256(f"{device_id}:{version}".encode()).hexdigest(), 16) % 100
+    return bucket < percent
+
+
+def _admin_error():
+    if not ADMIN_SECRET:
+        return jsonify({"error": "ADMIN_SECRET is not set on the server"}), 503
+    if not hmac.compare_digest(request.headers.get("x-admin-secret", ""), ADMIN_SECRET):
+        return jsonify({"error": "Invalid admin secret"}), 401
+    return None
+
+
+@app.get("/firmware/check")
+def firmware_check():
+    device_id, failure = _firmware_device()
+    if failure:
+        return failure
+    try:
+        current = int(request.args.get("version", "0"))
+    except ValueError:
+        return jsonify({"error": "Invalid version"}), 400
+    try:
+        with db_connect() as conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT version, size, sha256, notes, rollout_percent FROM firmware_releases
+                WHERE active AND version > %s ORDER BY version DESC
+            """, (current,))
+            rows = cur.fetchall()
+    except Exception:
+        app.logger.exception("Firmware check failed")
+        return jsonify({"error": "Firmware check unavailable"}), 503
+    for version, size, sha256, notes, percent in rows:
+        if _in_rollout(device_id, version, percent):
+            return jsonify({"update": True, "version": version, "size": size,
+                            "sha256": sha256, "notes": notes})
+    return jsonify({"update": False})
+
+
+@app.get("/firmware/download")
+def firmware_download():
+    device_id, failure = _firmware_device()
+    if failure:
+        return failure
+    try:
+        version = int(request.args.get("version", ""))
+    except ValueError:
+        return jsonify({"error": "Invalid version"}), 400
+    try:
+        with db_connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT firmware, sha256 FROM firmware_releases WHERE version = %s AND active",
+                        (version,))
+            row = cur.fetchone()
+    except Exception:
+        app.logger.exception("Firmware download failed")
+        return jsonify({"error": "Firmware unavailable"}), 503
+    if not row:
+        return jsonify({"error": "Firmware version not found"}), 404
+    image = bytes(row[0])
+    app.logger.info("Firmware %d downloaded by device %s", version, device_id)
+    response = Response(image, mimetype="application/octet-stream")
+    response.headers["Content-Length"] = str(len(image))
+    response.headers["X-Firmware-Sha256"] = row[1]
+    return response
+
+
+@app.get("/admin/firmware")
+def admin_firmware_list():
+    failure = _admin_error()
+    if failure:
+        return failure
+    with db_connect() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT version, size, sha256, notes, rollout_percent, active, created_at
+            FROM firmware_releases ORDER BY version DESC
+        """)
+        rows = cur.fetchall()
+    return jsonify({"releases": [{
+        "version": r[0], "size": r[1], "sha256": r[2], "notes": r[3],
+        "rollout_percent": r[4], "active": r[5], "created_at": r[6].isoformat()} for r in rows]})
+
+
+@app.post("/admin/firmware")
+def admin_firmware_upload():
+    failure = _admin_error()
+    if failure:
+        return failure
+    try:
+        version = int(request.headers.get("x-fw-version", ""))
+        rollout = int(request.headers.get("x-fw-rollout", "100"))
+    except ValueError:
+        return jsonify({"error": "x-fw-version and x-fw-rollout must be whole numbers"}), 400
+    if not (1 <= version <= 2_000_000_000) or not (0 <= rollout <= 100):
+        return jsonify({"error": "Version must be 1 or more and rollout 0 to 100"}), 400
+    notes = _decode_header_text(request.headers.get("x-fw-notes", ""), 200)
+    image = request.get_data(cache=False)
+    if not image or len(image) > FIRMWARE_MAX_BYTES:
+        return jsonify({"error": f"Firmware must be 1 to {FIRMWARE_MAX_BYTES} bytes"}), 413
+    if image[0] != 0xE9:
+        return jsonify({"error": "Not an ESP32 application image (use the plain .bin, not the merged one)"}), 415
+    digest = hashlib.sha256(image).hexdigest()
+    try:
+        with db_connect() as conn, conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO firmware_releases(version, firmware, size, sha256, notes, rollout_percent)
+                VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (version) DO NOTHING
+            """, (version, psycopg2.Binary(image), len(image), digest, notes, rollout))
+            created = cur.rowcount
+    except Exception:
+        app.logger.exception("Could not store firmware")
+        return jsonify({"error": "Could not store firmware"}), 503
+    if not created:
+        return jsonify({"error": f"Version {version} already exists; use the next number"}), 409
+    app.logger.info("Firmware %d stored: %d bytes, rollout %d%%", version, len(image), rollout)
+    return jsonify({"version": version, "size": len(image), "sha256": digest,
+                    "rollout_percent": rollout}), 201
+
+
+@app.patch("/admin/firmware/<int:version>")
+def admin_firmware_update(version):
+    failure = _admin_error()
+    if failure:
+        return failure
+    data = request.get_json(silent=True) or {}
+    sets, values = [], []
+    if "rollout_percent" in data:
+        percent = data["rollout_percent"]
+        if not isinstance(percent, int) or isinstance(percent, bool) or not 0 <= percent <= 100:
+            return jsonify({"error": "rollout_percent must be 0 to 100"}), 400
+        sets.append("rollout_percent = %s")
+        values.append(percent)
+    if "active" in data:
+        if not isinstance(data["active"], bool):
+            return jsonify({"error": "active must be true or false"}), 400
+        sets.append("active = %s")
+        values.append(data["active"])
+    if not sets:
+        return jsonify({"error": "Nothing to change"}), 400
+    with db_connect() as conn, conn.cursor() as cur:
+        cur.execute(f"UPDATE firmware_releases SET {', '.join(sets)} WHERE version = %s", values + [version])
+        changed = cur.rowcount
+    if not changed:
+        return jsonify({"error": "Firmware version not found"}), 404
+    return jsonify({"status": "updated"})
 
 
 if __name__ == "__main__":
