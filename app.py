@@ -2048,13 +2048,39 @@ def note_speech_audio(job_id):
         return jsonify({"error": "Narration job not found", "code": "job_lost"}), 404
     if job["state"] != "done":
         return jsonify({"error": "Narration is not ready", "code": "not_ready"}), 409
-    job["touched"] = time.time()
-    response = Response(_iter_pcm(job["pcm"].view()), mimetype="audio/L16")
-    response.headers["Content-Length"] = str(job["audio_bytes"])
-    response.headers["X-Sample-Rate"] = str(SPEECH_RATE)
-    response.headers["X-Audio-Channels"] = "1"
-    return response
 
+    job["touched"] = time.time()
+    view = job["pcm"].view()
+    total = job["audio_bytes"]
+    header = {"Accept-Ranges": "bytes", "X-Sample-Rate": str(SPEECH_RATE),
+              "X-Audio-Channels": "1"}
+    range_header = request.headers.get("Range", "")
+    if not range_header:
+        response = Response(_iter_pcm(view), mimetype="audio/L16")
+        response.headers["Content-Length"] = str(total)
+        response.headers.update(header)
+        return response
+
+    match = re.fullmatch(r"bytes=(\d+)-(\d*)", range_header.strip())
+    if not match:
+        response = Response(status=416)
+        response.headers["Content-Range"] = f"bytes */{total}"
+        response.headers.update(header)
+        return response
+    start = int(match.group(1))
+    end = int(match.group(2)) if match.group(2) else total - 1
+    if start >= total or end < start:
+        response = Response(status=416)
+        response.headers["Content-Range"] = f"bytes */{total}"
+        response.headers.update(header)
+        return response
+    end = min(end, total - 1)
+    length = end - start + 1
+    response = Response(_iter_pcm(view[start:end + 1]), status=206, mimetype="audio/L16")
+    response.headers["Content-Length"] = str(length)
+    response.headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+    response.headers.update(header)
+    return response
 
 @app.delete("/notes/speech/<job_id>")
 def delete_note_speech(job_id):
