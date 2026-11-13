@@ -2849,6 +2849,84 @@ SYNC_MAX_PACKAGE_BYTES = 9 * 1024 * 1024
 SYNC_MAX_USER_BYTES = int(os.environ.get("SYNC_MAX_USER_MB", "300")) * 1024 * 1024
 
 
+
+@app.get("/device/sync/audio")
+def device_sync_audio_status():
+    owner, err = device_profile_owner()
+    if err:
+        return err
+    device_id = request.headers.get("x-device-id", "")
+    profile_id = request.headers.get("x-profile-id", "")
+    note_key = request.args.get("note_key", "")
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,120}", note_key) or ".." in note_key:
+        return jsonify({"error": "Invalid note key"}), 400
+    try:
+        with db_connect() as conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT EXISTS(
+                    SELECT 1 FROM synced_notes
+                    WHERE device_id = %s AND profile_id = %s AND note_key = %s
+                      AND user_id = %s AND NOT cloud_deleted
+                ), EXISTS(
+                    SELECT 1 FROM synced_audio
+                    WHERE device_id = %s AND profile_id = %s AND note_key = %s AND user_id = %s
+                )
+            """, (device_id, profile_id, note_key, owner,
+                  device_id, profile_id, note_key, owner))
+            note_synced, audio_synced = cur.fetchone()
+        return jsonify({"note_synced": bool(note_synced), "audio_synced": bool(audio_synced)})
+    except Exception:
+        app.logger.exception("Could not check synced narration")
+        return jsonify({"error": "Audio sync unavailable"}), 503
+
+
+@app.post("/device/sync/audio")
+def device_sync_audio_upload():
+    owner, err = device_profile_owner()
+    if err:
+        return err
+    device_id = request.headers.get("x-device-id", "")
+    profile_id = request.headers.get("x-profile-id", "")
+    note_key = request.headers.get("x-note-key", "")
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,120}", note_key) or ".." in note_key:
+        return jsonify({"error": "Invalid note key"}), 400
+    if request.content_length is None or request.content_length < 44:
+        return jsonify({"error": "Invalid or missing WAV length"}), 400
+    if request.content_length > SYNC_MAX_AUDIO_BYTES:
+        return jsonify({"error": "Narration exceeds cloud audio limit"}), 413
+    wav = request.get_data(cache=False)
+    if len(wav) != request.content_length or len(wav) < 44 or wav[:4] != b"RIFF" or wav[8:12] != b"WAVE":
+        return jsonify({"error": "Invalid WAV data"}), 400
+    try:
+        with db_connect() as conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT 1 FROM synced_notes
+                WHERE device_id = %s AND profile_id = %s AND note_key = %s
+                  AND user_id = %s AND NOT cloud_deleted
+            """, (device_id, profile_id, note_key, owner))
+            if not cur.fetchone():
+                return jsonify({"error": "Sync the note before uploading its audio"}), 409
+            cur.execute("""
+                SELECT COALESCE((SELECT SUM(octet_length(package)) FROM synced_notes WHERE user_id = %s), 0)
+                     + COALESCE((SELECT SUM(wav_size) FROM synced_audio WHERE user_id = %s
+                                 AND NOT (device_id = %s AND profile_id = %s AND note_key = %s)), 0)
+            """, (owner, owner, device_id, profile_id, note_key))
+            used = int(cur.fetchone()[0])
+            if used + len(wav) > SYNC_MAX_USER_BYTES:
+                return jsonify({"error": "Cloud storage is full"}), 507
+            cur.execute("""
+                INSERT INTO synced_audio(device_id, profile_id, note_key, user_id, wav, wav_size)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT(device_id, profile_id, note_key) DO UPDATE SET
+                    user_id = EXCLUDED.user_id, wav = EXCLUDED.wav,
+                    wav_size = EXCLUDED.wav_size, created_at = NOW()
+            """, (device_id, profile_id, note_key, owner, psycopg2.Binary(wav), len(wav)))
+        return jsonify({"status": "synced", "audio_size": len(wav)}), 201
+    except Exception:
+        app.logger.exception("Could not upload existing narration")
+        return jsonify({"error": "Audio sync unavailable"}), 503
+
+
 def _decode_header_text(value, limit):
     from urllib.parse import unquote
     try:
