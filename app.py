@@ -338,6 +338,20 @@ def ensure_db():
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS synced_audio_user_idx ON synced_audio(user_id)")
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS synced_audio_upload_chunks (
+                    device_id TEXT NOT NULL,
+                    profile_id TEXT NOT NULL,
+                    note_key TEXT NOT NULL,
+                    user_id BIGINT NOT NULL REFERENCES app_users(user_id) ON DELETE CASCADE,
+                    total_size BIGINT NOT NULL,
+                    chunk_index INTEGER NOT NULL,
+                    chunk_data BYTEA NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (device_id, profile_id, note_key, chunk_index)
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS synced_audio_upload_chunks_updated_idx ON synced_audio_upload_chunks(updated_at)")
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS firmware_releases (
                     version INTEGER PRIMARY KEY,
                     firmware BYTEA NOT NULL,
@@ -2874,9 +2888,134 @@ def device_sync_audio_status():
             """, (device_id, profile_id, note_key, owner,
                   device_id, profile_id, note_key, owner))
             note_synced, audio_synced = cur.fetchone()
-        return jsonify({"note_synced": bool(note_synced), "audio_synced": bool(audio_synced)})
+            cur.execute("""
+                SELECT chunk_index, octet_length(chunk_data) FROM synced_audio_upload_chunks
+                WHERE device_id = %s AND profile_id = %s AND note_key = %s AND user_id = %s
+                ORDER BY chunk_index
+            """, (device_id, profile_id, note_key, owner))
+            chunks = cur.fetchall()
+        next_offset = 0
+        expected_index = 0
+        for chunk_index, chunk_length in chunks:
+            if int(chunk_index) != expected_index:
+                break
+            next_offset += int(chunk_length)
+            expected_index += 1
+        return jsonify({"note_synced": bool(note_synced), "audio_synced": bool(audio_synced),
+                        "upload_offset": next_offset})
     except Exception:
         app.logger.exception("Could not check synced narration")
+        return jsonify({"error": "Audio sync unavailable"}), 503
+
+
+SYNC_AUDIO_CHUNK_BYTES = 256 * 1024
+
+
+@app.post("/device/sync/audio/chunk")
+def device_sync_audio_upload_chunk():
+    owner, err = device_profile_owner()
+    if err:
+        return err
+    device_id = request.headers.get("x-device-id", "")
+    profile_id = request.headers.get("x-profile-id", "")
+    note_key = request.headers.get("x-note-key", "")
+    try:
+        total_size = int(request.headers.get("x-audio-total", "0"))
+        offset = int(request.headers.get("x-audio-offset", "-1"))
+    except ValueError:
+        return jsonify({"error": "Invalid audio range"}), 400
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,120}", note_key) or ".." in note_key:
+        return jsonify({"error": "Invalid note key"}), 400
+    if total_size < 44 or total_size > SYNC_MAX_AUDIO_BYTES or offset < 0 or offset >= total_size:
+        return jsonify({"error": "Invalid audio size or offset"}), 400
+    chunk_index = offset // SYNC_AUDIO_CHUNK_BYTES
+    expected_length = min(SYNC_AUDIO_CHUNK_BYTES, total_size - offset)
+    chunk = request.get_data(cache=False)
+    if offset != chunk_index * SYNC_AUDIO_CHUNK_BYTES or len(chunk) != expected_length:
+        return jsonify({"error": "Invalid audio chunk length"}), 400
+    try:
+        with db_connect() as conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT 1 FROM synced_notes
+                WHERE device_id = %s AND profile_id = %s AND note_key = %s
+                  AND user_id = %s AND NOT cloud_deleted
+            """, (device_id, profile_id, note_key, owner))
+            if not cur.fetchone():
+                return jsonify({"error": "Sync the note before uploading its audio"}), 409
+            cur.execute("""
+                DELETE FROM synced_audio_upload_chunks
+                WHERE updated_at < NOW() - INTERVAL '2 days'
+            """)
+            if offset == 0:
+                cur.execute("""
+                    DELETE FROM synced_audio_upload_chunks
+                    WHERE device_id = %s AND profile_id = %s AND note_key = %s AND user_id = %s
+                      AND total_size <> %s
+                """, (device_id, profile_id, note_key, owner, total_size))
+            else:
+                cur.execute("""
+                    SELECT 1 FROM synced_audio_upload_chunks
+                    WHERE device_id = %s AND profile_id = %s AND note_key = %s
+                      AND user_id = %s AND total_size <> %s LIMIT 1
+                """, (device_id, profile_id, note_key, owner, total_size))
+                if cur.fetchone():
+                    return jsonify({"error": "Upload size changed; restart required"}), 409
+            cur.execute("""
+                INSERT INTO synced_audio_upload_chunks
+                    (device_id, profile_id, note_key, user_id, total_size, chunk_index, chunk_data, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT(device_id, profile_id, note_key, chunk_index) DO UPDATE SET
+                    user_id = EXCLUDED.user_id, total_size = EXCLUDED.total_size,
+                    chunk_data = EXCLUDED.chunk_data, updated_at = NOW()
+            """, (device_id, profile_id, note_key, owner, total_size,
+                  chunk_index, psycopg2.Binary(chunk)))
+            cur.execute("""
+                SELECT chunk_index, chunk_data FROM synced_audio_upload_chunks
+                WHERE device_id = %s AND profile_id = %s AND note_key = %s AND user_id = %s
+                ORDER BY chunk_index
+            """, (device_id, profile_id, note_key, owner))
+            rows = cur.fetchall()
+            parts = []
+            received = 0
+            expected_index = 0
+            for saved_index, saved_data in rows:
+                if int(saved_index) != expected_index:
+                    break
+                piece = bytes(saved_data)
+                parts.append(piece)
+                received += len(piece)
+                expected_index += 1
+            if received < total_size:
+                return jsonify({"status": "receiving", "received": received, "total": total_size}), 202
+            wav = b"".join(parts)
+            if len(wav) != total_size or wav[:4] != b"RIFF" or wav[8:12] != b"WAVE":
+                cur.execute("""
+                    DELETE FROM synced_audio_upload_chunks
+                    WHERE device_id = %s AND profile_id = %s AND note_key = %s AND user_id = %s
+                """, (device_id, profile_id, note_key, owner))
+                return jsonify({"error": "Invalid WAV data"}), 400
+            cur.execute("""
+                SELECT COALESCE((SELECT SUM(octet_length(package)) FROM synced_notes WHERE user_id = %s), 0)
+                     + COALESCE((SELECT SUM(wav_size) FROM synced_audio WHERE user_id = %s
+                                 AND NOT (device_id = %s AND profile_id = %s AND note_key = %s)), 0)
+            """, (owner, owner, device_id, profile_id, note_key))
+            used = int(cur.fetchone()[0])
+            if used + total_size > SYNC_MAX_USER_BYTES:
+                return jsonify({"error": "Cloud storage is full"}), 507
+            cur.execute("""
+                INSERT INTO synced_audio(device_id, profile_id, note_key, user_id, wav, wav_size)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT(device_id, profile_id, note_key) DO UPDATE SET
+                    user_id = EXCLUDED.user_id, wav = EXCLUDED.wav,
+                    wav_size = EXCLUDED.wav_size, created_at = NOW()
+            """, (device_id, profile_id, note_key, owner, psycopg2.Binary(wav), total_size))
+            cur.execute("""
+                DELETE FROM synced_audio_upload_chunks
+                WHERE device_id = %s AND profile_id = %s AND note_key = %s AND user_id = %s
+            """, (device_id, profile_id, note_key, owner))
+        return jsonify({"status": "synced", "audio_size": total_size}), 201
+    except Exception:
+        app.logger.exception("Could not store narration upload chunk")
         return jsonify({"error": "Audio sync unavailable"}), 503
 
 
