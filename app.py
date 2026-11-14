@@ -167,10 +167,18 @@ def db_connect():
         raise RuntimeError("DATABASE_URL is not configured")
     conn = psycopg2.connect(DATABASE_URL, connect_timeout=5, sslmode="require")
     try:
-        with conn:
-            yield conn
+        yield conn
+        if not conn.closed:
+            conn.commit()
+    except Exception:
+        # Keep the original database/network exception if PostgreSQL has
+        # already closed the connection; rollback on a dead socket masks it.
+        if not conn.closed:
+            conn.rollback()
+        raise
     finally:
-        conn.close()
+        if not conn.closed:
+            conn.close()
 
 
 def ensure_db():
@@ -335,13 +343,29 @@ def ensure_db():
                     profile_id TEXT NOT NULL,
                     note_key TEXT NOT NULL,
                     user_id BIGINT NOT NULL REFERENCES app_users(user_id) ON DELETE CASCADE,
-                    wav BYTEA NOT NULL,
+                    wav BYTEA NOT NULL DEFAULT ''::bytea,
                     wav_size BIGINT NOT NULL,
+                    encoding TEXT NOT NULL DEFAULT 'wav',
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     PRIMARY KEY (device_id, profile_id, note_key)
                 )
             """)
+            cur.execute("ALTER TABLE synced_audio ADD COLUMN IF NOT EXISTS encoding TEXT NOT NULL DEFAULT 'wav'")
             cur.execute("CREATE INDEX IF NOT EXISTS synced_audio_user_idx ON synced_audio(user_id)")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS synced_audio_data_chunks (
+                    device_id TEXT NOT NULL,
+                    profile_id TEXT NOT NULL,
+                    note_key TEXT NOT NULL,
+                    user_id BIGINT NOT NULL REFERENCES app_users(user_id) ON DELETE CASCADE,
+                    chunk_index INTEGER NOT NULL,
+                    chunk_data BYTEA NOT NULL,
+                    source_bytes INTEGER NOT NULL,
+                    PRIMARY KEY (device_id, profile_id, note_key, chunk_index),
+                    FOREIGN KEY (device_id, profile_id, note_key)
+                        REFERENCES synced_audio(device_id, profile_id, note_key) ON DELETE CASCADE
+                )
+            """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS synced_audio_upload_chunks (
                     device_id TEXT NOT NULL,
@@ -1364,13 +1388,15 @@ def resample_speech_pcm_for_bm83(pcm):
     return b"".join(iter_speech_stereo(pcm))
 
 
-def wav_from_mono_pcm(pcm, rate=SPEECH_RATE):
+def wav_header_for_mono_pcm_size(size, rate=SPEECH_RATE):
     import struct
-    size = len(pcm)
-    header = (b"RIFF" + struct.pack("<I", 36 + size) + b"WAVEfmt " +
-              struct.pack("<IHHIIHH", 16, 1, 1, rate, rate * 2, 2, 16) +
-              b"data" + struct.pack("<I", size))
-    return header + bytes(pcm)
+    return (b"RIFF" + struct.pack("<I", 36 + size) + b"WAVEfmt " +
+            struct.pack("<IHHIIHH", 16, 1, 1, rate, rate * 2, 2, 16) +
+            b"data" + struct.pack("<I", size))
+
+
+def wav_from_mono_pcm(pcm, rate=SPEECH_RATE):
+    return wav_header_for_mono_pcm_size(len(pcm), rate) + bytes(pcm)
 
 
 def make_speech_mono(text, device_id=""):
@@ -1425,11 +1451,15 @@ def store_cloud_narration(job):
             if used + len(wav) > SYNC_MAX_USER_BYTES:
                 return "full"
             cur.execute("""
-                INSERT INTO synced_audio(device_id, profile_id, note_key, user_id, wav, wav_size)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                DELETE FROM synced_audio_data_chunks
+                WHERE device_id = %s AND profile_id = %s AND note_key = %s
+            """, (job["device_id"], profile_id, note_key))
+            cur.execute("""
+                INSERT INTO synced_audio(device_id, profile_id, note_key, user_id, wav, wav_size, encoding)
+                VALUES (%s, %s, %s, %s, %s, %s, 'wav')
                 ON CONFLICT(device_id, profile_id, note_key) DO UPDATE SET
                     user_id = EXCLUDED.user_id, wav = EXCLUDED.wav,
-                    wav_size = EXCLUDED.wav_size, created_at = NOW()
+                    wav_size = EXCLUDED.wav_size, encoding = 'wav', created_at = NOW()
             """, (job["device_id"], profile_id, note_key, owner, psycopg2.Binary(wav), len(wav)))
         return "synced"
     except Exception:
@@ -3064,44 +3094,43 @@ def device_sync_audio_upload_chunk():
                 return jsonify({"status": "receiving", "received": received,
                                 "total": total_pcm_size}), 202
 
-            # Fetch and decompress audio once, only after all source bytes
-            # have arrived. The stored cloud asset remains a standard WAV.
-            cur.execute("""
-                SELECT chunk_index, chunk_data, source_bytes FROM synced_audio_upload_chunks
-                WHERE device_id = %s AND profile_id = %s AND note_key = %s AND user_id = %s
-                ORDER BY chunk_index
-            """, (device_id, profile_id, note_key, owner))
-            decoded_parts = []
-            for saved_index, saved_block, saved_source_bytes in cur.fetchall():
-                source_length = int(saved_source_bytes)
-                decoded_parts.append(decode_ima_adpcm_block(bytes(saved_block), source_length))
-            pcm = b"".join(decoded_parts)
-            if len(pcm) != total_pcm_size:
-                return jsonify({"error": "Decoded audio size mismatch"}), 400
-            wav = wav_from_mono_pcm(pcm)
-            if len(wav) > SYNC_MAX_AUDIO_BYTES:
-                return jsonify({"error": "Narration exceeds cloud audio limit"}), 413
+            # Keep the already-compressed ADPCM blocks in PostgreSQL. A single
+            # 38 MB WAV BYTEA insert repeatedly severed the free database's SSL
+            # connection. The account download endpoint reconstructs a normal WAV.
+            audio_size = total_pcm_size + 44
             cur.execute("""
                 SELECT COALESCE((SELECT SUM(octet_length(package)) FROM synced_notes WHERE user_id = %s), 0)
                      + COALESCE((SELECT SUM(wav_size) FROM synced_audio WHERE user_id = %s
                                  AND NOT (device_id = %s AND profile_id = %s AND note_key = %s)), 0)
             """, (owner, owner, device_id, profile_id, note_key))
             used = int(cur.fetchone()[0])
-            if used + len(wav) > SYNC_MAX_USER_BYTES:
+            if used + audio_size > SYNC_MAX_USER_BYTES:
                 return jsonify({"error": "Cloud storage is full"}), 507
             cur.execute("""
-                INSERT INTO synced_audio(device_id, profile_id, note_key, user_id, wav, wav_size)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                DELETE FROM synced_audio_data_chunks
+                WHERE device_id = %s AND profile_id = %s AND note_key = %s AND user_id = %s
+            """, (device_id, profile_id, note_key, owner))
+            cur.execute("""
+                INSERT INTO synced_audio(device_id, profile_id, note_key, user_id, wav, wav_size, encoding)
+                VALUES (%s, %s, %s, %s, %s, %s, 'ima_adpcm')
                 ON CONFLICT(device_id, profile_id, note_key) DO UPDATE SET
                     user_id = EXCLUDED.user_id, wav = EXCLUDED.wav,
-                    wav_size = EXCLUDED.wav_size, created_at = NOW()
-            """, (device_id, profile_id, note_key, owner, psycopg2.Binary(wav), len(wav)))
+                    wav_size = EXCLUDED.wav_size, encoding = 'ima_adpcm', created_at = NOW()
+            """, (device_id, profile_id, note_key, owner, psycopg2.Binary(b""), audio_size))
+            cur.execute("""
+                INSERT INTO synced_audio_data_chunks
+                    (device_id, profile_id, note_key, user_id, chunk_index, chunk_data, source_bytes)
+                SELECT device_id, profile_id, note_key, user_id, chunk_index, chunk_data, source_bytes
+                FROM synced_audio_upload_chunks
+                WHERE device_id = %s AND profile_id = %s AND note_key = %s AND user_id = %s
+                ORDER BY chunk_index
+            """, (device_id, profile_id, note_key, owner))
             cur.execute("""
                 DELETE FROM synced_audio_upload_chunks
                 WHERE device_id = %s AND profile_id = %s AND note_key = %s AND user_id = %s
             """, (device_id, profile_id, note_key, owner))
         return jsonify({"status": "synced", "received": total_pcm_size,
-                        "audio_size": len(wav)}), 201
+                        "audio_size": audio_size}), 201
     except ValueError as exc:
         app.logger.warning("Invalid narration ADPCM block: %s", exc)
         return jsonify({"error": "Invalid compressed audio"}), 400
@@ -3145,11 +3174,15 @@ def device_sync_audio_upload():
             if used + len(wav) > SYNC_MAX_USER_BYTES:
                 return jsonify({"error": "Cloud storage is full"}), 507
             cur.execute("""
-                INSERT INTO synced_audio(device_id, profile_id, note_key, user_id, wav, wav_size)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                DELETE FROM synced_audio_data_chunks
+                WHERE device_id = %s AND profile_id = %s AND note_key = %s
+            """, (device_id, profile_id, note_key))
+            cur.execute("""
+                INSERT INTO synced_audio(device_id, profile_id, note_key, user_id, wav, wav_size, encoding)
+                VALUES (%s, %s, %s, %s, %s, %s, 'wav')
                 ON CONFLICT(device_id, profile_id, note_key) DO UPDATE SET
                     user_id = EXCLUDED.user_id, wav = EXCLUDED.wav,
-                    wav_size = EXCLUDED.wav_size, created_at = NOW()
+                    wav_size = EXCLUDED.wav_size, encoding = 'wav', created_at = NOW()
             """, (device_id, profile_id, note_key, owner, psycopg2.Binary(wav), len(wav)))
         return jsonify({"status": "synced", "audio_size": len(wav)}), 201
     except Exception:
@@ -3295,19 +3328,37 @@ def account_note_audio_download(note_id):
         return failure
     with db_connect() as conn, conn.cursor() as cur:
         cur.execute("""
-            SELECT n.note_key, a.wav FROM synced_notes n
+            SELECT n.note_key, a.wav, a.encoding, a.wav_size,
+                   a.device_id, a.profile_id, a.user_id
+            FROM synced_notes n
             JOIN synced_audio a
               ON a.device_id = n.device_id AND a.profile_id = n.profile_id
              AND a.note_key = n.note_key AND a.user_id = n.user_id
             WHERE n.note_id = %s AND n.user_id = %s AND NOT n.cloud_deleted
         """, (note_id, user[0]))
         row = cur.fetchone()
+        if row and row[2] == "ima_adpcm":
+            cur.execute("""
+                SELECT chunk_data, source_bytes FROM synced_audio_data_chunks
+                WHERE device_id = %s AND profile_id = %s AND note_key = %s AND user_id = %s
+                ORDER BY chunk_index
+            """, (row[4], row[5], row[0], row[6]))
+            audio_chunks = [(bytes(data), int(length)) for data, length in cur.fetchall()]
     if not row:
         return jsonify({"error": "No narration audio for this note"}), 404
     name = re.sub(r"\.md$", "", row[0], flags=re.I) + ".wav"
-    wav = bytes(row[1])
-    response = Response(wav, mimetype="audio/wav")
-    response.headers["Content-Length"] = str(len(wav))
+    if row[2] == "ima_adpcm":
+        pcm_size = int(row[3]) - 44
+        def wav_stream():
+            yield wav_header_for_mono_pcm_size(pcm_size)
+            for compressed, source_length in audio_chunks:
+                yield decode_ima_adpcm_block(compressed, source_length)
+        response = Response(wav_stream(), mimetype="audio/wav")
+        response.headers["Content-Length"] = str(int(row[3]))
+    else:
+        wav = bytes(row[1])
+        response = Response(wav, mimetype="audio/wav")
+        response.headers["Content-Length"] = str(len(wav))
     response.headers["Content-Disposition"] = f'attachment; filename="{name}"'
     return response
 
