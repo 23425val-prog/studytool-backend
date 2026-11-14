@@ -3022,16 +3022,18 @@ def device_sync_audio_upload_chunk():
                     updated_at = NOW()
             """, (device_id, profile_id, note_key, owner, total_pcm_size, chunk_index,
                   psycopg2.Binary(block), source_bytes))
+            # Partial uploads only need a small metadata scan to find the
+            # contiguous source-byte prefix. Decoding every saved ADPCM block
+            # on every request made cumulative work quadratic and timed out
+            # Render's synchronous Gunicorn worker on larger narrations.
             cur.execute("""
-                SELECT chunk_index, chunk_data, source_bytes FROM synced_audio_upload_chunks
+                SELECT chunk_index, source_bytes FROM synced_audio_upload_chunks
                 WHERE device_id = %s AND profile_id = %s AND note_key = %s AND user_id = %s
                 ORDER BY chunk_index
             """, (device_id, profile_id, note_key, owner))
-            rows = cur.fetchall()
-            decoded_parts = []
             received = 0
             expected_index = 0
-            for saved_index, saved_block, saved_source_bytes in rows:
+            for saved_index, saved_source_bytes in cur.fetchall():
                 if int(saved_index) != expected_index:
                     break
                 source_length = int(saved_source_bytes)
@@ -3039,12 +3041,23 @@ def device_sync_audio_upload_chunk():
                                              total_pcm_size - received)
                 if source_length != expected_source_length:
                     break
-                decoded_parts.append(decode_ima_adpcm_block(bytes(saved_block), source_length))
                 received += source_length
                 expected_index += 1
             if received < total_pcm_size:
                 return jsonify({"status": "receiving", "received": received,
                                 "total": total_pcm_size}), 202
+
+            # Fetch and decompress audio once, only after all source bytes
+            # have arrived. The stored cloud asset remains a standard WAV.
+            cur.execute("""
+                SELECT chunk_index, chunk_data, source_bytes FROM synced_audio_upload_chunks
+                WHERE device_id = %s AND profile_id = %s AND note_key = %s AND user_id = %s
+                ORDER BY chunk_index
+            """, (device_id, profile_id, note_key, owner))
+            decoded_parts = []
+            for saved_index, saved_block, saved_source_bytes in cur.fetchall():
+                source_length = int(saved_source_bytes)
+                decoded_parts.append(decode_ima_adpcm_block(bytes(saved_block), source_length))
             pcm = b"".join(decoded_parts)
             if len(pcm) != total_pcm_size:
                 return jsonify({"error": "Decoded audio size mismatch"}), 400
