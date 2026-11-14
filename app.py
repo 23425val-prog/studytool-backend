@@ -21,6 +21,11 @@ import secrets
 import smtplib
 import time
 from email.message import EmailMessage
+
+try:
+    import audioop  # Native IMA ADPCM decoder, supplied by audioop-lts on Python 3.13+.
+except ImportError:
+    audioop = None
 import tempfile
 import threading
 import wave
@@ -2933,6 +2938,18 @@ def decode_ima_adpcm_block(block, source_bytes):
     index = block[2]
     if index > 88 or block[3] != 0:
         raise ValueError("Invalid ADPCM block header")
+
+    # Native audioop-lts decoding avoids Render's worker timeout while
+    # preserving the IMA/DVI format. The encoder leaves one pad nibble:
+    # trim that extra decoded sample and prepend the block seed.
+    if audioop is not None:
+        decoded, _state = audioop.adpcm2lin(bytes(block[4:]), 2, (predictor, index))
+        decoded = decoded[:max(0, samples - 1) * 2]
+        out = predictor.to_bytes(2, "little", signed=True) + decoded
+        if len(out) != source_bytes:
+            raise ValueError("Incomplete ADPCM block")
+        return out
+
     out = bytearray(source_bytes)
     out[0:2] = int(predictor).to_bytes(2, "little", signed=True)
     sample_index = 1
