@@ -2959,6 +2959,9 @@ IMA_STEP_TABLE = (
 )
 
 
+IMA_NIBBLE_SWAP = bytes(((value & 0x0F) << 4) | (value >> 4) for value in range(256))
+
+
 def decode_ima_adpcm_block(block, source_bytes):
     samples = source_bytes // 2
     expected = 4 + samples // 2
@@ -2973,7 +2976,9 @@ def decode_ima_adpcm_block(block, source_bytes):
     # preserving the IMA/DVI format. The encoder leaves one pad nibble:
     # trim that extra decoded sample and prepend the block seed.
     if audioop is not None:
-        decoded, _state = audioop.adpcm2lin(bytes(block[4:]), 2, (predictor, index))
+        # The ESP32 encoder emits low nibble first; audioop consumes high nibble first.
+        swapped_nibbles = bytes(block[4:]).translate(IMA_NIBBLE_SWAP)
+        decoded, _state = audioop.adpcm2lin(swapped_nibbles, 2, (predictor, index))
         decoded = decoded[:max(0, samples - 1) * 2]
         out = predictor.to_bytes(2, "little", signed=True) + decoded
         if len(out) != source_bytes:
