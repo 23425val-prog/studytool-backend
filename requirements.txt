@@ -6,3 +6,4 @@ reportlab>=4.2,<5
 numpy>=1.26
 edge-tts>=7.0.0
 miniaudio>=1.59
+audioop-lts>=0.2.2; python_version >= "3.13"
